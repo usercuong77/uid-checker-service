@@ -148,6 +148,18 @@ async def probe_redirect(uid: str, session: aiohttp.ClientSession, headers: Dict
                     target = urlparse(location if re.match(r"^https?://", location, re.I) else f"https://www.facebook.com{location if location.startswith('/') else '/' + location}")
                     source_path = f"/{uid}"
                     target_path = (target.path or "/") + (target.query and f"?{target.query}" or "")
+                    target_path_low = target_path.lower()
+
+                    auth_redirect_markers = [
+                        "/login",
+                        "/checkpoint",
+                        "/recover",
+                        "/security",
+                        "/accounts",
+                    ]
+                    if any(marker in target_path_low for marker in auth_redirect_markers):
+                        return "UNKNOWN", f"redirect_auth_wall:{location}"
+
                     if target_path.lower() != source_path.lower():
                         return "LIVE", f"redirect_changed:{location}"
                     return "DIE", "redirect_same_path"
@@ -233,8 +245,12 @@ async def check_uid(uid: str, proxy: Optional[str] = None) -> Dict[str, Any]:
     status = "UNKNOWN"
     reason = "no_strong_signal"
 
+    # Graph default avatar is a strong DIE signal and should override redirect noise.
+    if graph_state == "DIE" and graph_reason.startswith("graph_default_avatar:"):
+        status = "DIE"
+        reason = graph_reason
     # Prioritize strong LIVE signals first to avoid false CHECKPOINT from mbasic login shells.
-    if redirect_state == "LIVE":
+    elif redirect_state == "LIVE":
         status = "LIVE"
         reason = redirect_reason
     elif graph_state == "LIVE":
