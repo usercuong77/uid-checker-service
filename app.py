@@ -3,7 +3,7 @@ import json
 import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import aiohttp
 from fastapi import FastAPI, Header, HTTPException, Request, Response
@@ -141,6 +141,31 @@ def build_forward_url(base_url: str, query_string: str = "") -> str:
     return f"{target}{separator}{query}"
 
 
+def normalize_sepay_api_key_value(raw: Any) -> str:
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+
+    match = re.match(r"^apikey\s+(.+)$", value, flags=re.IGNORECASE)
+    return str(match.group(1) if match else value).strip()
+
+
+def augment_query_string_with_sepay_key(query_string: str = "", headers: Optional[Dict[str, str]] = None) -> str:
+    params = parse_qs(str(query_string or "").lstrip("?"), keep_blank_values=True)
+    if params.get("sepay_key") or params.get("api_key"):
+        return urlencode(params, doseq=True)
+
+    normalized_headers = headers or {}
+    api_key = normalize_sepay_api_key_value(
+        normalized_headers.get("Authorization") or normalized_headers.get("X-Api-Key") or normalized_headers.get("x-api-key")
+    )
+    if not api_key:
+        return urlencode(params, doseq=True)
+
+    params["sepay_key"] = [api_key]
+    return urlencode(params, doseq=True)
+
+
 def get_forwardable_sepay_headers(headers: Any) -> Dict[str, str]:
     out: Dict[str, str] = {}
     if not headers:
@@ -162,7 +187,9 @@ async def forward_sepay_webhook(
     headers: Optional[Dict[str, str]] = None,
     query_string: str = "",
 ) -> Dict[str, Any]:
-    upstream_url = build_forward_url(target_url, query_string)
+    safe_headers = headers or {}
+    upstream_query = augment_query_string_with_sepay_key(query_string, safe_headers)
+    upstream_url = build_forward_url(target_url, upstream_query)
     if not upstream_url:
         raise HTTPException(status_code=503, detail="sepay_relay_target_missing")
 
@@ -173,7 +200,7 @@ async def forward_sepay_webhook(
                 (method or "POST").upper(),
                 upstream_url,
                 data=body,
-                headers=headers or {},
+                headers=safe_headers,
                 allow_redirects=True,
             ) as resp:
                 return {
