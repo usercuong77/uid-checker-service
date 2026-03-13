@@ -157,7 +157,10 @@ def augment_query_string_with_sepay_key(query_string: str = "", headers: Optiona
 
     normalized_headers = headers or {}
     api_key = normalize_sepay_api_key_value(
-        normalized_headers.get("Authorization") or normalized_headers.get("X-Api-Key") or normalized_headers.get("x-api-key")
+        normalized_headers.get("Authorization")
+        or normalized_headers.get("authorization")
+        or normalized_headers.get("X-Api-Key")
+        or normalized_headers.get("x-api-key")
     )
     if not api_key:
         return urlencode(params, doseq=True)

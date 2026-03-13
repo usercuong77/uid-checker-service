@@ -118,7 +118,7 @@ Flow:
 
 1. SePay goi `POST` vao URL ngan tren Render.
 2. Relay giu nguyen `Authorization`, `Content-Type`, body JSON va query string.
-3. Neu co `Authorization: Apikey ...` hoac `X-Api-Key`, relay tu dong them `?sepay_key=...` vao URL upstream de Apps Script doc duoc API key on dinh.
+3. Neu co `Authorization: Apikey ...`, `authorization: Apikey ...` hoac `X-Api-Key`, relay tu dong them `?sepay_key=...` vao URL upstream de Apps Script doc duoc API key on dinh.
 4. Relay forward sang `SEPAY_RELAY_TARGET_URL`.
 5. Apps Script xu ly webhook SePay nhu cu.
 
