@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 import aiohttp
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 try:
@@ -24,6 +24,12 @@ APP_NAME = "uid-checker-service"
 API_KEY = os.getenv("UID_CHECKER_API_KEY", "").strip()
 HTTP_TIMEOUT_SECONDS = float(os.getenv("UID_CHECKER_TIMEOUT", "10"))
 _UA = UserAgent() if UserAgent else None
+FORWARDED_SEPAY_HEADERS = {
+    "authorization",
+    "content-type",
+    "user-agent",
+    "x-api-key",
+}
 
 
 DIE_KEYWORDS = [
@@ -107,6 +113,80 @@ class CheckRequest(BaseModel):
 
 
 app = FastAPI(title=APP_NAME)
+
+
+def get_sepay_relay_target_url() -> str:
+    return str(os.getenv("SEPAY_RELAY_TARGET_URL", "")).strip()
+
+
+def get_sepay_relay_timeout_seconds() -> float:
+    raw = str(os.getenv("SEPAY_RELAY_TIMEOUT", "20")).strip()
+    try:
+        value = float(raw)
+    except Exception:
+        value = 20.0
+    return max(1.0, value)
+
+
+def build_forward_url(base_url: str, query_string: str = "") -> str:
+    target = str(base_url or "").strip()
+    if not target:
+        return ""
+
+    query = str(query_string or "").lstrip("?").strip()
+    if not query:
+        return target
+
+    separator = "&" if "?" in target else "?"
+    return f"{target}{separator}{query}"
+
+
+def get_forwardable_sepay_headers(headers: Any) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    if not headers:
+        return out
+
+    items = headers.items() if hasattr(headers, "items") else []
+    for key, value in items:
+        header_name = str(key or "").strip()
+        if not header_name or header_name.lower() not in FORWARDED_SEPAY_HEADERS:
+            continue
+        out[header_name] = str(value or "").strip()
+    return out
+
+
+async def forward_sepay_webhook(
+    method: str,
+    target_url: str,
+    body: bytes,
+    headers: Optional[Dict[str, str]] = None,
+    query_string: str = "",
+) -> Dict[str, Any]:
+    upstream_url = build_forward_url(target_url, query_string)
+    if not upstream_url:
+        raise HTTPException(status_code=503, detail="sepay_relay_target_missing")
+
+    timeout = aiohttp.ClientTimeout(total=get_sepay_relay_timeout_seconds())
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.request(
+                (method or "POST").upper(),
+                upstream_url,
+                data=body,
+                headers=headers or {},
+                allow_redirects=True,
+            ) as resp:
+                return {
+                    "status_code": int(resp.status),
+                    "body": await resp.read(),
+                    "content_type": str(resp.headers.get("Content-Type", "application/json; charset=utf-8")),
+                }
+    except HTTPException:
+        raise
+    except asyncio.TimeoutError as err:
+        raise HTTPException(status_code=504, detail=f"sepay_relay_timeout:{err}") from err
+    except Exception as err:
+        raise HTTPException(status_code=502, detail=f"sepay_relay_error:{err}") from err
 
 
 def parse_cookie_json(raw: str) -> Dict[str, str]:
@@ -685,7 +765,27 @@ def ensure_api_key(x_api_key: Optional[str]) -> None:
 
 @app.get("/health")
 async def health() -> Dict[str, Any]:
-    return {"ok": True, "service": APP_NAME}
+    return {
+        "ok": True,
+        "service": APP_NAME,
+        "sepayRelayReady": bool(get_sepay_relay_target_url()),
+    }
+
+
+@app.post("/sepay-webhook")
+async def sepay_webhook_relay(request: Request) -> Response:
+    upstream = await forward_sepay_webhook(
+        "POST",
+        get_sepay_relay_target_url(),
+        await request.body(),
+        get_forwardable_sepay_headers(request.headers),
+        request.url.query,
+    )
+    return Response(
+        content=upstream["body"],
+        status_code=upstream["status_code"],
+        headers={"Content-Type": upstream["content_type"]},
+    )
 
 
 @app.post("/check")
