@@ -14,6 +14,7 @@ cd weblamquoccuong/uid-checker-service
 python -m venv .venv
 .venv\\Scripts\\activate
 pip install -r requirements.txt
+playwright install chromium
 ```
 
 ## 2) Chay local
@@ -76,6 +77,24 @@ curl -X POST http://127.0.0.1:8080/check ^
   -d "{\"uid\":\"100041775009544\",\"cookiesPool\":[{\"c_user\":\"1000xxxxxxxx\",\"xs\":\"xx:xxxxxxxxxxxxxxxx\"},{\"c_user\":\"1000yyyyyyyy\",\"xs\":\"yy:yyyyyyyyyyyyyyyy\"}]}"
 ```
 
+Check TikTok LIVE:
+
+```bash
+curl -X POST http://127.0.0.1:8080/live-check ^
+  -H "Content-Type: application/json" ^
+  -H "X-Api-Key: your_secret_key" ^
+  -d "{\"platform\":\"tiktok\",\"usernames\":[\"tiktok_user1\",\"tiktok_user2\"]}"
+```
+
+Check Instagram LIVE (co the truyen proxy pool):
+
+```bash
+curl -X POST http://127.0.0.1:8080/live-check ^
+  -H "Content-Type: application/json" ^
+  -H "X-Api-Key: your_secret_key" ^
+  -d "{\"platform\":\"instagram\",\"usernames\":[\"ig_user1\",\"ig_user2\"],\"proxies\":[\"http://user:pass@host:port\"],\"concurrency\":25}"
+```
+
 ## 3) Noi vao Apps Script
 
 Mo `apps-script/case_manager_bot.gs`, trong `CONFIG`:
@@ -98,6 +117,8 @@ Vao Render -> Service -> Environment:
   - Co the la URL `/exec` neu Render follow redirect tot.
   - On dinh nhat la dan thang URL dich day du cua Apps Script neu ban da co.
 - `SEPAY_RELAY_TIMEOUT`: timeout relay, mac dinh `20` giay.
+- `LIVE_CHECK_CONCURRENCY`: gioi han song song cho LIVE check, mac dinh `25`.
+- `LIVE_CHECK_TIMEOUT_MS`: timeout load trang cho LIVE check, mac dinh `15000`.
 
 Ghi chu:
 

@@ -19,10 +19,22 @@ try:
 except Exception:
     BeautifulSoup = None
 
+try:
+    from TikTokLive import TikTokLiveClient
+except Exception:
+    TikTokLiveClient = None
+
+try:
+    from playwright.async_api import async_playwright
+except Exception:
+    async_playwright = None
+
 
 APP_NAME = "uid-checker-service"
 API_KEY = os.getenv("UID_CHECKER_API_KEY", "").strip()
 HTTP_TIMEOUT_SECONDS = float(os.getenv("UID_CHECKER_TIMEOUT", "10"))
+LIVE_CHECK_DEFAULT_CONCURRENCY = int(os.getenv("LIVE_CHECK_CONCURRENCY", "25"))
+LIVE_CHECK_PAGE_TIMEOUT_MS = int(os.getenv("LIVE_CHECK_TIMEOUT_MS", "15000"))
 _UA = UserAgent() if UserAgent else None
 FORWARDED_SEPAY_HEADERS = {
     "authorization",
@@ -110,6 +122,14 @@ class CheckRequest(BaseModel):
     cookies: Optional[Dict[str, str]] = Field(default=None)
     cookiesPool: Optional[List[Dict[str, str]]] = Field(default=None)
     cookies_pool: Optional[List[Dict[str, str]]] = Field(default=None)
+
+
+class LiveCheckRequest(BaseModel):
+    platform: Optional[str] = Field(default=None)
+    usernames: Optional[List[str]] = Field(default=None)
+    proxy: Optional[str] = Field(default=None)
+    proxies: Optional[List[str]] = Field(default=None)
+    concurrency: Optional[int] = Field(default=None)
 
 
 app = FastAPI(title=APP_NAME)
@@ -238,7 +258,250 @@ def parse_cookie_json(raw: str) -> Dict[str, str]:
         cv = str(val or "").strip()
         if ck and cv:
             cleaned[ck] = cv
+
     return cleaned
+
+
+def normalize_social_username(raw: Any) -> str:
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    return value[1:] if value.startswith("@") else value
+
+
+def normalize_url_input(raw: Any) -> str:
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    if value.startswith("http://") or value.startswith("https://"):
+        return value
+    return f"https://{value}"
+
+
+def extract_tiktok_username(raw: Any) -> str:
+    value = normalize_social_username(raw)
+    if not value:
+        return ""
+    if "tiktok.com" in value.lower():
+        try:
+            parsed = urlparse(normalize_url_input(value))
+            match = re.search(r"@([^/]+)", parsed.path or "")
+            return str(match.group(1)).strip() if match else ""
+        except Exception:
+            match = re.search(r"tiktok\\.com/@([^/?#]+)", value, flags=re.IGNORECASE)
+            return str(match.group(1)).strip() if match else ""
+    return value
+
+
+def extract_instagram_username(raw: Any) -> str:
+    value = normalize_social_username(raw)
+    if not value:
+        return ""
+    if "instagram.com" in value.lower():
+        try:
+            parsed = urlparse(normalize_url_input(value))
+            path = str(parsed.path or "").strip("/")
+            first = path.split("/")[0] if path else ""
+            reserved = {
+                "",
+                "accounts",
+                "explore",
+                "reel",
+                "reels",
+                "p",
+                "tv",
+                "stories",
+                "direct",
+                "developer",
+                "about",
+                "legal",
+            }
+            return first if first and first.lower() not in reserved else ""
+        except Exception:
+            match = re.search(r"instagram\\.com/([^/?#]+)", value, flags=re.IGNORECASE)
+            return str(match.group(1)).strip() if match else ""
+    return value
+
+
+def normalize_live_usernames(usernames: Optional[List[Any]], platform: str) -> List[str]:
+    items = usernames if isinstance(usernames, list) else []
+    out: List[str] = []
+    seen: Dict[str, bool] = {}
+    for raw in items:
+        username = extract_tiktok_username(raw) if platform == "tiktok" else extract_instagram_username(raw)
+        normalized = normalize_social_username(username)
+        if not normalized or normalized in seen:
+            continue
+        seen[normalized] = True
+        out.append(normalized)
+    return out
+
+
+def pick_live_concurrency(value: Optional[int]) -> int:
+    try:
+        parsed = int(value or 0)
+    except Exception:
+        parsed = 0
+    if parsed <= 0:
+        parsed = LIVE_CHECK_DEFAULT_CONCURRENCY
+    return max(1, min(60, parsed))
+
+
+def normalize_proxy_pool(proxy: Optional[str], proxies: Optional[List[str]]) -> List[Optional[str]]:
+    pool: List[Optional[str]] = []
+    if proxy:
+        pool.append(str(proxy).strip())
+    if proxies:
+        for item in proxies:
+            val = str(item or "").strip()
+            if val:
+                pool.append(val)
+    return pool
+
+
+def attach_error_result(username: str, reason: str) -> Dict[str, Any]:
+    return {"username": username, "is_live": False, "status": "unknown", "reason": reason}
+
+
+async def check_tiktok_single(username: str) -> Dict[str, Any]:
+    name = normalize_social_username(username)
+    if not name:
+        return attach_error_result(username, "empty_username")
+    if TikTokLiveClient is None:
+        return attach_error_result(name, "tiktoklive_missing")
+
+    client = None
+    try:
+        client = TikTokLiveClient(unique_id=name)
+        is_live = await client.is_live()
+        if not is_live:
+            return {"username": name, "is_live": False, "viewer": 0, "room_id": None, "status": "offline"}
+
+        info = await client.get_room_info()
+        viewer_count = int(info.get("viewer_count", 0)) if isinstance(info, dict) else 0
+        return {
+            "username": name,
+            "is_live": True,
+            "viewer": max(0, viewer_count),
+            "room_id": getattr(client, "room_id", None),
+            "status": "live",
+        }
+    except Exception as err:
+        return attach_error_result(name, f"tiktok_error:{err}")
+    finally:
+        if client and hasattr(client, "close"):
+            try:
+                result = client.close()
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:
+                pass
+
+
+async def bulk_check_tiktok(usernames: List[str]) -> List[Dict[str, Any]]:
+    tasks = [check_tiktok_single(name) for name in usernames]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    out: List[Dict[str, Any]] = []
+    for item, name in zip(results, usernames):
+        if isinstance(item, Exception):
+            out.append(attach_error_result(name, f"tiktok_error:{item}"))
+        else:
+            out.append(item)
+    return out
+
+
+async def check_instagram_single(username: str, browser, semaphore: asyncio.Semaphore) -> Dict[str, Any]:
+    name = normalize_social_username(username)
+    if not name:
+        return attach_error_result(username, "empty_username")
+    if async_playwright is None:
+        return attach_error_result(name, "playwright_missing")
+
+    async with semaphore:
+        context = None
+        page = None
+        try:
+            context = await browser.new_context(
+                viewport={"width": 1280, "height": 720},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            )
+            page = await context.new_page()
+            await page.goto(
+                f"https://www.instagram.com/{name}/",
+                timeout=LIVE_CHECK_PAGE_TIMEOUT_MS,
+                wait_until="domcontentloaded",
+            )
+            await page.wait_for_timeout(1200)
+
+            live_text_count = await page.locator("text=LIVE").count()
+            avatar = page.locator("img[alt*='profile picture']").first
+            style = await avatar.get_attribute("style") if avatar else ""
+            has_gradient = "gradient" in str(style or "").lower()
+            is_live = live_text_count > 0 or has_gradient
+
+            return {"username": name, "is_live": bool(is_live), "status": "live" if is_live else "offline"}
+        except Exception as err:
+            return attach_error_result(name, f"ig_error:{err}")
+        finally:
+            try:
+                if page:
+                    await page.close()
+            except Exception:
+                pass
+            try:
+                if context:
+                    await context.close()
+            except Exception:
+                pass
+
+
+async def bulk_check_instagram(usernames: List[str], proxies: List[Optional[str]], concurrency: int) -> List[Dict[str, Any]]:
+    if async_playwright is None:
+        return [attach_error_result(name, "playwright_missing") for name in usernames]
+
+    proxy_pool = proxies or [None]
+    if not proxy_pool:
+        proxy_pool = [None]
+
+    buckets: Dict[Optional[str], List[str]] = {}
+    for idx, name in enumerate(usernames):
+        proxy = proxy_pool[idx % len(proxy_pool)]
+        buckets.setdefault(proxy, []).append(name)
+
+    semaphore = asyncio.Semaphore(concurrency)
+    results: List[Dict[str, Any]] = []
+
+    async with async_playwright() as p:
+        async def run_bucket(proxy: Optional[str], bucket: List[str]) -> List[Dict[str, Any]]:
+            browser = await p.chromium.launch(
+                headless=True,
+                proxy={"server": proxy} if proxy else None,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            try:
+                tasks = [check_instagram_single(name, browser, semaphore) for name in bucket]
+                bucket_results = await asyncio.gather(*tasks, return_exceptions=True)
+                out: List[Dict[str, Any]] = []
+                for item, name in zip(bucket_results, bucket):
+                    if isinstance(item, Exception):
+                        out.append(attach_error_result(name, f"ig_error:{item}"))
+                    else:
+                        out.append(item)
+                return out
+            finally:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
+        bucket_tasks = [run_bucket(proxy, bucket) for proxy, bucket in buckets.items()]
+        bucket_outputs = await asyncio.gather(*bucket_tasks, return_exceptions=True)
+        for output in bucket_outputs:
+            if isinstance(output, Exception):
+                continue
+            results.extend(output)
+
+    return results
 
 
 def normalize_cookies(cookies: Optional[Dict[str, str]]) -> Dict[str, str]:
@@ -835,3 +1098,38 @@ async def check(req: CheckRequest, x_api_key: Optional[str] = Header(default=Non
     result = await check_uid(uid, req.proxy, req.cookies, request_pool)
     result["ok"] = True
     return result
+
+
+@app.post("/live-check")
+@app.post("/live-check/")
+@app.post("/livecheck")
+@app.post("/check-live")
+async def live_check(req: LiveCheckRequest, x_api_key: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    ensure_api_key(x_api_key)
+
+    platform_raw = str(req.platform or "").strip().lower()
+    if platform_raw in {"tt", "tiktok"}:
+        platform = "tiktok"
+    elif platform_raw in {"ig", "instagram"}:
+        platform = "instagram"
+    else:
+        raise HTTPException(status_code=400, detail="unsupported_platform")
+
+    usernames = normalize_live_usernames(req.usernames, platform)
+    if not usernames:
+        raise HTTPException(status_code=400, detail="empty_usernames")
+
+    concurrency = pick_live_concurrency(req.concurrency)
+    proxy_pool = normalize_proxy_pool(req.proxy, req.proxies)
+
+    if platform == "tiktok":
+        results = await bulk_check_tiktok(usernames)
+    else:
+        results = await bulk_check_instagram(usernames, proxy_pool, concurrency)
+
+    return {
+        "ok": True,
+        "platform": platform,
+        "total": len(results),
+        "results": results,
+    }
