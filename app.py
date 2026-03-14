@@ -24,6 +24,8 @@ try:
 except Exception:
     TikTokLiveClient = None
 
+# Playwright is intentionally optional. If not installed, IG live checks will
+# fall back to lightweight HTTP parsing to keep Render builds simple.
 try:
     from playwright.async_api import async_playwright
 except Exception:
@@ -410,98 +412,120 @@ async def bulk_check_tiktok(usernames: List[str]) -> List[Dict[str, Any]]:
     return out
 
 
-async def check_instagram_single(username: str, browser, semaphore: asyncio.Semaphore) -> Dict[str, Any]:
+def parse_instagram_live_from_html(html: str) -> Optional[bool]:
+    if not html:
+        return None
+    low = html.lower()
+    if '"is_live":true' in low or '"is_live_broadcasting":true' in low:
+        return True
+    if '"is_live":false' in low or '"is_live_broadcasting":false' in low:
+        return False
+    return None
+
+
+async def fetch_instagram_live_status(
+    username: str,
+    session: aiohttp.ClientSession,
+    proxy: Optional[str],
+) -> Dict[str, Any]:
     name = normalize_social_username(username)
     if not name:
         return attach_error_result(username, "empty_username")
-    if async_playwright is None:
-        return attach_error_result(name, "playwright_missing")
 
-    async with semaphore:
-        context = None
-        page = None
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,vi;q=0.8",
+        "Referer": f"https://www.instagram.com/{name}/",
+        "X-IG-App-ID": "936619743392459",
+    }
+
+    endpoints = [
+        f"https://i.instagram.com/api/v1/users/web_profile_info/?username={name}",
+        f"https://www.instagram.com/api/v1/users/web_profile_info/?username={name}",
+        f"https://www.instagram.com/{name}/?__a=1&__d=dis",
+    ]
+
+    last_error = ""
+    for url in endpoints:
         try:
-            context = await browser.new_context(
-                viewport={"width": 1280, "height": 720},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            )
-            page = await context.new_page()
-            await page.goto(
-                f"https://www.instagram.com/{name}/",
-                timeout=LIVE_CHECK_PAGE_TIMEOUT_MS,
-                wait_until="domcontentloaded",
-            )
-            await page.wait_for_timeout(1200)
+            async with session.get(url, headers=headers, proxy=proxy, allow_redirects=True) as resp:
+                text = await resp.text(errors="ignore")
+                if resp.status != 200:
+                    last_error = f"http_{resp.status}"
+                    continue
 
-            live_text_count = await page.locator("text=LIVE").count()
-            avatar = page.locator("img[alt*='profile picture']").first
-            style = await avatar.get_attribute("style") if avatar else ""
-            has_gradient = "gradient" in str(style or "").lower()
-            is_live = live_text_count > 0 or has_gradient
+                # Prefer JSON if possible.
+                payload = None
+                try:
+                    payload = await resp.json(content_type=None)
+                except Exception:
+                    payload = None
 
-            return {"username": name, "is_live": bool(is_live), "status": "live" if is_live else "offline"}
+                if isinstance(payload, dict):
+                    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+                    user = data.get("user") if isinstance(data, dict) else None
+                    if isinstance(user, dict):
+                        is_live = bool(
+                            user.get("is_live")
+                            or user.get("is_live_broadcasting")
+                            or user.get("live_broadcasting")
+                        )
+                        return {
+                            "username": name,
+                            "is_live": is_live,
+                            "status": "live" if is_live else "offline",
+                        }
+
+                html_live = parse_instagram_live_from_html(text)
+                if html_live is not None:
+                    return {
+                        "username": name,
+                        "is_live": bool(html_live),
+                        "status": "live" if html_live else "offline",
+                    }
         except Exception as err:
-            return attach_error_result(name, f"ig_error:{err}")
-        finally:
-            try:
-                if page:
-                    await page.close()
-            except Exception:
-                pass
-            try:
-                if context:
-                    await context.close()
-            except Exception:
-                pass
+            last_error = f"ig_error:{err}"
+
+    return attach_error_result(name, last_error or "ig_fetch_failed")
+
+
+async def check_instagram_single_http(
+    username: str,
+    session: aiohttp.ClientSession,
+    semaphore: asyncio.Semaphore,
+    proxy: Optional[str],
+) -> Dict[str, Any]:
+    name = normalize_social_username(username)
+    if not name:
+        return attach_error_result(username, "empty_username")
+    async with semaphore:
+        return await fetch_instagram_live_status(name, session, proxy)
 
 
 async def bulk_check_instagram(usernames: List[str], proxies: List[Optional[str]], concurrency: int) -> List[Dict[str, Any]]:
-    if async_playwright is None:
-        return [attach_error_result(name, "playwright_missing") for name in usernames]
-
     proxy_pool = proxies or [None]
     if not proxy_pool:
         proxy_pool = [None]
-
-    buckets: Dict[Optional[str], List[str]] = {}
-    for idx, name in enumerate(usernames):
-        proxy = proxy_pool[idx % len(proxy_pool)]
-        buckets.setdefault(proxy, []).append(name)
-
     semaphore = asyncio.Semaphore(concurrency)
-    results: List[Dict[str, Any]] = []
+    timeout_sec = max(5.0, LIVE_CHECK_PAGE_TIMEOUT_MS / 1000.0)
+    timeout = aiohttp.ClientTimeout(total=timeout_sec)
 
-    async with async_playwright() as p:
-        async def run_bucket(proxy: Optional[str], bucket: List[str]) -> List[Dict[str, Any]]:
-            browser = await p.chromium.launch(
-                headless=True,
-                proxy={"server": proxy} if proxy else None,
-                args=["--no-sandbox", "--disable-dev-shm-usage"],
-            )
-            try:
-                tasks = [check_instagram_single(name, browser, semaphore) for name in bucket]
-                bucket_results = await asyncio.gather(*tasks, return_exceptions=True)
-                out: List[Dict[str, Any]] = []
-                for item, name in zip(bucket_results, bucket):
-                    if isinstance(item, Exception):
-                        out.append(attach_error_result(name, f"ig_error:{item}"))
-                    else:
-                        out.append(item)
-                return out
-            finally:
-                try:
-                    await browser.close()
-                except Exception:
-                    pass
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        tasks = []
+        for idx, name in enumerate(usernames):
+            proxy = proxy_pool[idx % len(proxy_pool)]
+            tasks.append(check_instagram_single_http(name, session, semaphore, proxy))
 
-        bucket_tasks = [run_bucket(proxy, bucket) for proxy, bucket in buckets.items()]
-        bucket_outputs = await asyncio.gather(*bucket_tasks, return_exceptions=True)
-        for output in bucket_outputs:
-            if isinstance(output, Exception):
-                continue
-            results.extend(output)
-
-    return results
+        bucket_results = await asyncio.gather(*tasks, return_exceptions=True)
+        out: List[Dict[str, Any]] = []
+        for item, name in zip(bucket_results, usernames):
+            if isinstance(item, Exception):
+                out.append(attach_error_result(name, f"ig_error:{item}"))
+            else:
+                out.append(item)
+        return out
 
 
 def normalize_cookies(cookies: Optional[Dict[str, str]]) -> Dict[str, str]:
