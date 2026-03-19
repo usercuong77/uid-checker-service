@@ -38,6 +38,8 @@ API_KEY = os.getenv("UID_CHECKER_API_KEY", "").strip()
 HTTP_TIMEOUT_SECONDS = float(os.getenv("UID_CHECKER_TIMEOUT", "10"))
 LIVE_CHECK_DEFAULT_CONCURRENCY = int(os.getenv("LIVE_CHECK_CONCURRENCY", "25"))
 LIVE_CHECK_PAGE_TIMEOUT_MS = int(os.getenv("LIVE_CHECK_TIMEOUT_MS", "15000"))
+UID_PROBE_UA_FILE = os.getenv("UID_PROBE_UA_FILE", "uid_probe_user_agents.txt").strip()
+UID_PROBE_ACCEPT_LANGUAGE = os.getenv("UID_PROBE_ACCEPT_LANGUAGE", "en-US,en;q=0.9,vi;q=0.8").strip()
 _UA = UserAgent() if UserAgent else None
 FORWARDED_SEPAY_HEADERS = {
     "authorization",
@@ -289,6 +291,35 @@ def normalize_url_input(raw: Any) -> str:
     if value.startswith("http://") or value.startswith("https://"):
         return value
     return f"https://{value}"
+
+
+def load_uid_probe_user_agents(file_path_raw: Optional[str] = None) -> List[str]:
+    raw_path = str(file_path_raw or UID_PROBE_UA_FILE or "").strip()
+    if not raw_path:
+        return []
+
+    file_path = raw_path
+    if not os.path.isabs(file_path):
+        file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), file_path)
+
+    try:
+        with open(file_path, "r", encoding="utf-8") as handle:
+            rows = handle.readlines()
+    except Exception:
+        return []
+
+    out: List[str] = []
+    seen = set()
+    for row in rows:
+        value = str(row or "").strip()
+        if not value or value.startswith("#"):
+            continue
+        key = value.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(value)
+    return out
 
 
 def extract_tiktok_username(raw: Any) -> str:
@@ -713,25 +744,27 @@ def build_facebook_probe_urls(url_raw: Any) -> List[str]:
     return out
 
 
+FALLBACK_UID_PROBE_USER_AGENTS = [
+    "Mozilla/5.0",
+    "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+]
+FILE_UID_PROBE_USER_AGENTS = load_uid_probe_user_agents()
+
+
 def build_uid_probe_header_candidates() -> List[Dict[str, str]]:
-    accept_language = "en-US,en;q=0.9,vi;q=0.8"
+    accept_language = UID_PROBE_ACCEPT_LANGUAGE or "en-US,en;q=0.9,vi;q=0.8"
+    user_agents = FILE_UID_PROBE_USER_AGENTS + FALLBACK_UID_PROBE_USER_AGENTS
     candidates: List[Dict[str, str]] = [
         {
-            "User-Agent": "Mozilla/5.0",
+            "User-Agent": ua,
             "Accept-Language": accept_language,
-        },
-        {
-            "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
-            "Accept-Language": accept_language,
-        },
-        {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": accept_language,
-        },
+        }
+        for ua in user_agents
     ]
 
     out: List[Dict[str, str]] = []
