@@ -7,6 +7,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 import aiohttp
 from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 try:
@@ -114,6 +115,16 @@ PROFILE_NAME_BLOCKLIST = [
     "forgot password",
     "quen mat khau",
     "meta",
+]
+
+UID_SCRAPE_PATTERNS = [
+    r'"userID"\s*:\s*"(\d{8,20})"',
+    r'"profile_id"\s*:\s*(\d{8,20})',
+    r'"entity_id"\s*:\s*"(\d{8,20})"',
+    r'"actorID"\s*:\s*"(\d{8,20})"',
+    r'"subject_id"\s*:\s*"(\d{8,20})"',
+    r'profile\.php\?id=(\d{8,20})',
+    r'fb://profile/(\d{8,20})',
 ]
 
 
@@ -652,6 +663,103 @@ def extract_uid_from_url(url_raw: Optional[str]) -> str:
     return ""
 
 
+def extract_uid_from_html(html_raw: Any) -> str:
+    html = str(html_raw or "")
+    if not html:
+        return ""
+
+    normalized = (
+        html.replace("\\/", "/")
+        .replace("\\u002f", "/")
+        .replace("\\u003a", ":")
+        .replace("&quot;", '"')
+    )
+
+    for pattern in UID_SCRAPE_PATTERNS:
+        match = re.search(pattern, normalized, flags=re.I)
+        if not match:
+            continue
+        uid = str(match.group(1) if match.groups() else "").strip()
+        if re.fullmatch(r"\d{8,20}", uid):
+            return uid
+    return ""
+
+
+def build_facebook_probe_urls(url_raw: Any) -> List[str]:
+    normalized = normalize_url_input(url_raw)
+    if not normalized:
+        return []
+
+    urls: List[str] = [normalized]
+    try:
+        parsed = urlparse(normalized)
+        host = (parsed.netloc or "").lower()
+        if "facebook.com" in host or "fb.com" in host:
+            path = parsed.path or "/"
+            query = f"?{parsed.query}" if parsed.query else ""
+            urls.append(f"https://m.facebook.com{path}{query}")
+            urls.append(f"https://www.facebook.com{path}{query}")
+    except Exception:
+        pass
+
+    out: List[str] = []
+    seen = set()
+    for item in urls:
+        key = str(item or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+async def resolve_uid_from_facebook_url(url_raw: Any, proxy: Optional[str] = None) -> str:
+    normalized = normalize_url_input(url_raw)
+    direct_uid = extract_uid_from_url(normalized)
+    if direct_uid:
+        return direct_uid
+
+    probe_urls = build_facebook_probe_urls(normalized)
+    if not probe_urls:
+        return ""
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9,vi;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+
+    timeout = aiohttp.ClientTimeout(total=max(5.0, HTTP_TIMEOUT_SECONDS))
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for probe_url in probe_urls:
+                try:
+                    async with session.get(
+                        probe_url,
+                        headers=headers,
+                        proxy=proxy,
+                        allow_redirects=True,
+                    ) as resp:
+                        body = await resp.text(errors="ignore")
+                        uid_from_html = extract_uid_from_html(body)
+                        if uid_from_html:
+                            return uid_from_html
+
+                        uid_from_final_url = extract_uid_from_url(str(resp.url))
+                        if uid_from_final_url:
+                            return uid_from_final_url
+                except Exception:
+                    continue
+    except Exception:
+        return ""
+
+    return ""
+
+
 def contains_any(text: str, keywords: list[str]) -> bool:
     low = text.lower()
     return any(k in low for k in keywords)
@@ -1087,6 +1195,44 @@ async def health() -> Dict[str, Any]:
         "service": APP_NAME,
         "sepayRelayReady": bool(get_sepay_relay_target_url()),
     }
+
+
+@app.get("/get-uid")
+async def get_uid(url: Optional[str] = None, proxy: Optional[str] = None, x_api_key: Optional[str] = Header(default=None)) -> Any:
+    ensure_api_key(x_api_key)
+
+    fb_url = str(url or "").strip()
+    if not fb_url:
+        return JSONResponse(status_code=400, content={"success": False, "error": "Thiếu tham số url"})
+
+    uid = await resolve_uid_from_facebook_url(fb_url, proxy)
+    normalized_url = normalize_url_input(fb_url)
+    if uid:
+        return {"success": True, "uid": uid, "url": normalized_url}
+
+    return JSONResponse(
+        status_code=404,
+        content={"success": False, "error": "Không tìm thấy UID", "url": normalized_url},
+    )
+
+
+@app.post("/get-uid")
+async def get_uid_post(req: CheckRequest, x_api_key: Optional[str] = Header(default=None)) -> Any:
+    ensure_api_key(x_api_key)
+
+    fb_url = str(req.url or "").strip()
+    if not fb_url:
+        return JSONResponse(status_code=400, content={"success": False, "error": "Thiếu tham số url"})
+
+    uid = await resolve_uid_from_facebook_url(fb_url, req.proxy)
+    normalized_url = normalize_url_input(fb_url)
+    if uid:
+        return {"success": True, "uid": uid, "url": normalized_url}
+
+    return JSONResponse(
+        status_code=404,
+        content={"success": False, "error": "Không tìm thấy UID", "url": normalized_url},
+    )
 
 
 @app.post("/sepay-webhook")
