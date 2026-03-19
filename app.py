@@ -713,6 +713,38 @@ def build_facebook_probe_urls(url_raw: Any) -> List[str]:
     return out
 
 
+def build_uid_probe_header_candidates() -> List[Dict[str, str]]:
+    accept_language = "en-US,en;q=0.9,vi;q=0.8"
+    candidates: List[Dict[str, str]] = [
+        {
+            "User-Agent": "Mozilla/5.0",
+            "Accept-Language": accept_language,
+        },
+        {
+            "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+            "Accept-Language": accept_language,
+        },
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": accept_language,
+        },
+    ]
+
+    out: List[Dict[str, str]] = []
+    seen = set()
+    for item in candidates:
+        key = f"{item.get('User-Agent', '').strip().lower()}|{item.get('Accept-Language', '').strip().lower()}"
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
 async def resolve_uid_from_facebook_url(url_raw: Any, proxy: Optional[str] = None) -> str:
     normalized = normalize_url_input(url_raw)
     direct_uid = extract_uid_from_url(normalized)
@@ -723,37 +755,30 @@ async def resolve_uid_from_facebook_url(url_raw: Any, proxy: Optional[str] = Non
     if not probe_urls:
         return ""
 
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9,vi;q=0.8",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    }
+    header_candidates = build_uid_probe_header_candidates()
 
     timeout = aiohttp.ClientTimeout(total=max(5.0, HTTP_TIMEOUT_SECONDS))
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            for probe_url in probe_urls:
-                try:
-                    async with session.get(
-                        probe_url,
-                        headers=headers,
-                        proxy=proxy,
-                        allow_redirects=True,
-                    ) as resp:
-                        body = await resp.text(errors="ignore")
-                        uid_from_html = extract_uid_from_html(body)
-                        if uid_from_html:
-                            return uid_from_html
+            for headers in header_candidates:
+                for probe_url in probe_urls:
+                    try:
+                        async with session.get(
+                            probe_url,
+                            headers=headers,
+                            proxy=proxy,
+                            allow_redirects=True,
+                        ) as resp:
+                            body = await resp.text(errors="ignore")
+                            uid_from_html = extract_uid_from_html(body)
+                            if uid_from_html:
+                                return uid_from_html
 
-                        uid_from_final_url = extract_uid_from_url(str(resp.url))
-                        if uid_from_final_url:
-                            return uid_from_final_url
-                except Exception:
-                    continue
+                            uid_from_final_url = extract_uid_from_url(str(resp.url))
+                            if uid_from_final_url:
+                                return uid_from_final_url
+                    except Exception:
+                        continue
     except Exception:
         return ""
 
