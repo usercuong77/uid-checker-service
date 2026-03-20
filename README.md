@@ -6,11 +6,12 @@ Canonical cross-system handover guide:
 
 Service nay cung cap API check UID Facebook de Apps Script goi sang.
 Ngoai ra service co them relay webhook ngan cho SePay, de tranh vuong gioi han do dai URL khi can forward sang Apps Script.
+Service nay cung co the lam relay webhook Telegram cho bot chinh/bot con, de tranh loi 302/401/405 khi Telegram goi truc tiep Apps Script.
 
 ## 1) Cai dat
 
 ```bash
-cd weblamquoccuong/uid-checker-service
+cd weblamquoccuong/Bot/uid-checker-service
 python -m venv .venv
 .venv\\Scripts\\activate
 pip install -r requirements.txt
@@ -25,13 +26,15 @@ set UID_CHECKER_FB_COOKIES_JSON={"c_user":"1000xxxxxxxx","xs":"xx:xxxxxxxxxxxxxx
 set UID_CHECKER_FB_COOKIES_POOL_JSON=[{"c_user":"1000xxxxxxxx","xs":"xx:xxxxxxxxxxxxxxxx"},{"c_user":"1000yyyyyyyy","xs":"yy:yyyyyyyyyyyyyyyy"}]
 set SEPAY_RELAY_TARGET_URL=https://script.googleusercontent.com/macros/echo?user_content_key=...&lib=...
 set SEPAY_RELAY_TIMEOUT=20
+set TELEGRAM_RELAY_TARGET_URL=https://script.google.com/macros/s/DEPLOY_ID/exec
+set TELEGRAM_RELAY_TIMEOUT=20
 uvicorn app:app --host 0.0.0.0 --port 8080
 ```
 
 Chay unit test:
 
 ```bash
-cd weblamquoccuong/uid-checker-service
+cd weblamquoccuong/Bot/uid-checker-service
 .venv\\Scripts\\python.exe -m unittest discover -s tests -v
 ```
 
@@ -48,6 +51,14 @@ curl -X POST http://127.0.0.1:8080/sepay-webhook ^
   -H "Content-Type: application/json" ^
   -H "Authorization: Apikey your_sepay_key" ^
   -d "{\"id\":123,\"transferType\":\"in\"}"
+```
+
+Relay webhook Telegram local:
+
+```bash
+curl -X POST "http://127.0.0.1:8080/telegram-webhook?bot=buff" ^
+  -H "Content-Type: application/json" ^
+  -d "{\"update_id\":1,\"message\":{\"message_id\":1,\"chat\":{\"id\":123},\"text\":\"/start\"}}"
 ```
 
 Check UID:
@@ -97,7 +108,7 @@ curl -X POST http://127.0.0.1:8080/live-check ^
 
 ## 3) Noi vao Apps Script
 
-Mo `apps-script/case_manager_bot.gs`, trong `CONFIG`:
+Mo `weblamquoccuong/Bot/apps-script/case_manager_bot.gs`, trong `CONFIG`:
 
 - `externalCheckerUrl`: URL public cua service Python (`https://.../check`)
 - `externalCheckerApiKey`: key trung voi `UID_CHECKER_API_KEY`
@@ -117,6 +128,10 @@ Vao Render -> Service -> Environment:
   - Co the la URL `/exec` neu Render follow redirect tot.
   - On dinh nhat la dan thang URL dich day du cua Apps Script neu ban da co.
 - `SEPAY_RELAY_TIMEOUT`: timeout relay, mac dinh `20` giay.
+- `TELEGRAM_RELAY_TARGET_URL`: URL Apps Script `/exec` ma Telegram relay se forward toi.
+  - Khuyen nghi dung URL Web App `/exec` goc cua Apps Script.
+  - Query string tu Telegram relay se duoc giu nguyen, vi du `?bot=buff` hoac `?bot=uid`.
+- `TELEGRAM_RELAY_TIMEOUT`: timeout relay Telegram, mac dinh `20` giay.
 - `LIVE_CHECK_CONCURRENCY`: gioi han song song cho LIVE check, mac dinh `25`.
 - `LIVE_CHECK_TIMEOUT_MS`: timeout load trang cho LIVE check, mac dinh `15000`.
 
@@ -148,3 +163,24 @@ Luu y:
 - Khong dung Bitly/TinyURL cho webhook thanh toan.
 - Relay nay da duoc viet de xu ly `POST`, khong phai link click thong thuong.
 - Neu Apps Script dang can query secret kieu `?sepay_key=...`, relay se giu nguyen query string khi forward.
+
+## 6) Dung relay URL ngan cho Telegram webhook
+
+Neu Telegram goi truc tiep Apps Script bi loi `302 Moved Temporarily`, `401 Unauthorized` hoac `405 Method Not Allowed`, dung URL ngan nay:
+
+```text
+https://<render-service>.onrender.com/telegram-webhook
+```
+
+Flow:
+
+1. Telegram goi `POST` vao Render relay.
+2. Relay giu nguyen body JSON update, query string va header quan trong.
+3. Relay forward sang `TELEGRAM_RELAY_TARGET_URL` va follow redirect thay cho Telegram.
+4. Apps Script nhan duoc update goc. Neu query co `?bot=buff` / `?bot=uid`, code Apps Script se route dung bot con.
+
+Vi du URL webhook:
+
+- Bot chinh: `https://<render-service>.onrender.com/telegram-webhook`
+- Bot buff: `https://<render-service>.onrender.com/telegram-webhook?bot=buff`
+- Bot UID: `https://<render-service>.onrender.com/telegram-webhook?bot=uid`

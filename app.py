@@ -47,6 +47,11 @@ FORWARDED_SEPAY_HEADERS = {
     "user-agent",
     "x-api-key",
 }
+FORWARDED_TELEGRAM_HEADERS = {
+    "content-type",
+    "user-agent",
+    "x-telegram-bot-api-secret-token",
+}
 
 
 DIE_KEYWORDS = [
@@ -163,6 +168,19 @@ def get_sepay_relay_timeout_seconds() -> float:
     return max(1.0, value)
 
 
+def get_telegram_relay_target_url() -> str:
+    return str(os.getenv("TELEGRAM_RELAY_TARGET_URL", "")).strip()
+
+
+def get_telegram_relay_timeout_seconds() -> float:
+    raw = str(os.getenv("TELEGRAM_RELAY_TIMEOUT", "20")).strip()
+    try:
+        value = float(raw)
+    except Exception:
+        value = 20.0
+    return max(1.0, value)
+
+
 def build_forward_url(base_url: str, query_string: str = "") -> str:
     target = str(base_url or "").strip()
     if not target:
@@ -218,6 +236,20 @@ def get_forwardable_sepay_headers(headers: Any) -> Dict[str, str]:
     return out
 
 
+def get_forwardable_telegram_headers(headers: Any) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    if not headers:
+        return out
+
+    items = headers.items() if hasattr(headers, "items") else []
+    for key, value in items:
+        header_name = str(key or "").strip()
+        if not header_name or header_name.lower() not in FORWARDED_TELEGRAM_HEADERS:
+            continue
+        out[header_name] = str(value or "").strip()
+    return out
+
+
 async def forward_sepay_webhook(
     method: str,
     target_url: str,
@@ -252,6 +284,41 @@ async def forward_sepay_webhook(
         raise HTTPException(status_code=504, detail=f"sepay_relay_timeout:{err}") from err
     except Exception as err:
         raise HTTPException(status_code=502, detail=f"sepay_relay_error:{err}") from err
+
+
+async def forward_telegram_webhook(
+    method: str,
+    target_url: str,
+    body: bytes,
+    headers: Optional[Dict[str, str]] = None,
+    query_string: str = "",
+) -> Dict[str, Any]:
+    safe_headers = headers or {}
+    upstream_url = build_forward_url(target_url, query_string)
+    if not upstream_url:
+        raise HTTPException(status_code=503, detail="telegram_relay_target_missing")
+
+    timeout = aiohttp.ClientTimeout(total=get_telegram_relay_timeout_seconds())
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.request(
+                (method or "POST").upper(),
+                upstream_url,
+                data=body,
+                headers=safe_headers,
+                allow_redirects=True,
+            ) as resp:
+                return {
+                    "status_code": int(resp.status),
+                    "body": await resp.read(),
+                    "content_type": str(resp.headers.get("Content-Type", "application/json; charset=utf-8")),
+                }
+    except HTTPException:
+        raise
+    except asyncio.TimeoutError as err:
+        raise HTTPException(status_code=504, detail=f"telegram_relay_timeout:{err}") from err
+    except Exception as err:
+        raise HTTPException(status_code=502, detail=f"telegram_relay_error:{err}") from err
 
 
 def parse_cookie_json(raw: str) -> Dict[str, str]:
@@ -1252,6 +1319,7 @@ async def health() -> Dict[str, Any]:
         "ok": True,
         "service": APP_NAME,
         "sepayRelayReady": bool(get_sepay_relay_target_url()),
+        "telegramRelayReady": bool(get_telegram_relay_target_url()),
     }
 
 
@@ -1300,6 +1368,23 @@ async def sepay_webhook_relay(request: Request) -> Response:
         get_sepay_relay_target_url(),
         await request.body(),
         get_forwardable_sepay_headers(request.headers),
+        request.url.query,
+    )
+    return Response(
+        content=upstream["body"],
+        status_code=upstream["status_code"],
+        headers={"Content-Type": upstream["content_type"]},
+    )
+
+
+@app.post("/telegram-webhook")
+@app.post("/telegram-webhook/")
+async def telegram_webhook_relay(request: Request) -> Response:
+    upstream = await forward_telegram_webhook(
+        "POST",
+        get_telegram_relay_target_url(),
+        await request.body(),
+        get_forwardable_telegram_headers(request.headers),
         request.url.query,
     )
     return Response(

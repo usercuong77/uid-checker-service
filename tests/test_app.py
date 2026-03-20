@@ -135,12 +135,32 @@ class SepayRelayHelperTests(unittest.TestCase):
         )
 
 
+class TelegramRelayHelperTests(unittest.TestCase):
+    def test_get_forwardable_telegram_headers_filters_non_whitelisted_headers(self):
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "TelegramBot (like TwitterBot)",
+            "X-Telegram-Bot-Api-Secret-Token": "secret-token",
+            "Host": "uid-checker-service.onrender.com",
+        }
+        filtered = checker_app.get_forwardable_telegram_headers(headers)
+        self.assertEqual(
+            filtered,
+            {
+                "Content-Type": "application/json",
+                "User-Agent": "TelegramBot (like TwitterBot)",
+                "X-Telegram-Bot-Api-Secret-Token": "secret-token",
+            },
+        )
+
+
 class EndpointLogicTests(unittest.IsolatedAsyncioTestCase):
     async def test_health_returns_ok(self):
         result = await checker_app.health()
         self.assertTrue(result["ok"])
         self.assertEqual(result["service"], checker_app.APP_NAME)
         self.assertIn("sepayRelayReady", result)
+        self.assertIn("telegramRelayReady", result)
 
     async def test_check_invalid_uid_returns_unknown(self):
         req = checker_app.CheckRequest(uid="not-a-valid-uid")
@@ -247,6 +267,69 @@ class EndpointLogicTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(fake_session.request_args["allow_redirects"])
         self.assertEqual(result["status_code"], 201)
         self.assertEqual(result["body"], b'{"ok":true}')
+        self.assertEqual(result["content_type"], "application/json")
+
+    async def test_forward_telegram_webhook_requires_target_url(self):
+        with self.assertRaises(checker_app.HTTPException) as ctx:
+            await checker_app.forward_telegram_webhook("POST", "", b"{}", {}, "bot=buff")
+        self.assertEqual(ctx.exception.status_code, 503)
+
+    async def test_forward_telegram_webhook_returns_upstream_response(self):
+        class FakeResponse:
+            def __init__(self):
+                self.status = 200
+                self.headers = {"Content-Type": "application/json"}
+
+            async def read(self):
+                return b'{"ok":true,"source":"telegram"}'
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class FakeSession:
+            def __init__(self, *args, **kwargs):
+                self.request_args = None
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def request(self, method, url, data=None, headers=None, allow_redirects=None):
+                self.request_args = {
+                    "method": method,
+                    "url": url,
+                    "data": data,
+                    "headers": headers,
+                    "allow_redirects": allow_redirects,
+                }
+                return FakeResponse()
+
+        fake_session = FakeSession()
+
+        with patch.object(checker_app.aiohttp, "ClientSession", return_value=fake_session):
+            result = await checker_app.forward_telegram_webhook(
+                "POST",
+                "https://script.google.com/macros/s/abc/exec",
+                b'{"update_id":1}',
+                {"Content-Type": "application/json"},
+                "bot=uid",
+            )
+
+        self.assertEqual(fake_session.request_args["method"], "POST")
+        self.assertEqual(
+            fake_session.request_args["url"],
+            "https://script.google.com/macros/s/abc/exec?bot=uid",
+        )
+        self.assertEqual(fake_session.request_args["data"], b'{"update_id":1}')
+        self.assertEqual(fake_session.request_args["headers"], {"Content-Type": "application/json"})
+        self.assertTrue(fake_session.request_args["allow_redirects"])
+        self.assertEqual(result["status_code"], 200)
+        self.assertEqual(result["body"], b'{"ok":true,"source":"telegram"}')
         self.assertEqual(result["content_type"], "application/json")
 
 
