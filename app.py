@@ -152,7 +152,6 @@ LATEST_POST_ID_PATTERNS = [
     r'(?:^|[?&]|%3f|%26)story_fbid(?:=|%3d)([A-Za-z0-9_]{8,})',
     r'permalink\.php(?:\?|%3f)[^"\'\s<>]*?(?:[?&]|%26)story_fbid(?:=|%3d)([A-Za-z0-9_]{8,})',
     r'\/posts\/([A-Za-z0-9_]{8,})',
-    r'\b(pfbid[A-Za-z0-9_]{12,})\b',
     r'(?:^|[?&]|%3f|%26)fbid(?:=|%3d)(\d{8,})',
 ]
 LATEST_POST_TIME_PATTERNS = [
@@ -963,7 +962,7 @@ def build_latest_post_link(uid_raw: Any, post_id_raw: Any) -> str:
     if is_story_fbid_token(post_id):
         encoded_story = quote(post_id, safe="")
         encoded_uid = quote(uid, safe="")
-        return f"https://www.facebook.com/story.php?story_fbid={encoded_story}&id={encoded_uid}"
+        return f"https://www.facebook.com/permalink.php?story_fbid={encoded_story}&id={encoded_uid}"
     return f"https://www.facebook.com/{uid}/posts/{post_id}"
 
 
@@ -1076,6 +1075,25 @@ def parse_latest_post_from_html(html_raw: Any) -> Optional[Dict[str, Any]]:
         "postId": post_id,
         "timestamp": timestamp,
     }
+
+
+def has_latest_post_evidence_in_html(html_raw: Any, post_id_raw: Any) -> bool:
+    html = normalize_facebook_payload_text(html_raw)
+    post_id = str(post_id_raw or "").strip()
+    if not html or not post_id:
+        return False
+
+    escaped_post_id = re.escape(post_id)
+    evidence_patterns = [
+        rf'"post_id"\s*:\s*"?{escaped_post_id}"?',
+        rf'"top_level_post_id"\s*:\s*"?{escaped_post_id}"?',
+        rf'"story_fbid"\s*:\s*"?{escaped_post_id}"?',
+        rf'"legacy_fbid"\s*:\s*"?{escaped_post_id}"?',
+        rf'(?:^|[?&]|%3f|%26)story_fbid(?:=|%3d){escaped_post_id}(?:\b|[&#%])',
+        rf'(?:^|[?&]|%3f|%26)fbid(?:=|%3d){escaped_post_id}(?:\b|[&#%])',
+        rf'/posts/{escaped_post_id}(?:\b|[/?#])',
+    ]
+    return any(re.search(pattern, html, flags=re.I) for pattern in evidence_patterns)
 
 
 def build_latest_post_failure_reason(body_raw: Any, final_url_raw: Any, http_code_raw: Any) -> str:
@@ -1292,8 +1310,11 @@ async def fetch_latest_facebook_post_once(
                         body = await resp.text(errors="ignore")
                         final_url = str(resp.url)
                         parsed = parse_latest_post_from_html(body)
+                        has_post_candidate = bool(parsed and is_latest_post_id_token(parsed.get("postId")))
+                        has_evidence = has_post_candidate and has_latest_post_evidence_in_html(body, parsed.get("postId"))
+                        http_success = 200 <= http_code < 400
 
-                        if parsed:
+                        if has_post_candidate and has_evidence and http_success:
                             return {
                                 "ok": True,
                                 "uid": normalized_uid,
@@ -1313,12 +1334,14 @@ async def fetch_latest_facebook_post_once(
                                     }
                                 ],
                             }
-
+                        fail_reason = build_latest_post_failure_reason(body, final_url, http_code)
+                        if has_post_candidate and not has_evidence and http_success:
+                            fail_reason = f"latest_post_candidate_untrusted_http_{http_code or 0}"
                         attempts.append(
                             {
                                 "url": probe_url,
                                 "httpCode": http_code,
-                                "reason": build_latest_post_failure_reason(body, final_url, http_code),
+                                "reason": fail_reason,
                                 "finalUrl": final_url,
                             }
                         )
