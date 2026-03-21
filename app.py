@@ -151,6 +151,9 @@ LATEST_POST_ID_PATTERNS = [
     r'"legacy_fbid"\s*:\s*(\d{8,})',
     r'(?:^|[?&]|%3f|%26)story_fbid(?:=|%3d)([A-Za-z0-9_]{8,})',
     r'permalink\.php(?:\?|%3f)[^"\'\s<>]*?(?:[?&]|%26)story_fbid(?:=|%3d)([A-Za-z0-9_]{8,})',
+    r'\/posts\/([A-Za-z0-9_]{8,})',
+    r'\b(pfbid[A-Za-z0-9_]{12,})\b',
+    r'(?:^|[?&]|%3f|%26)fbid(?:=|%3d)(\d{8,})',
 ]
 LATEST_POST_TIME_PATTERNS = [
     r'"publish_time"\s*:\s*(\d{9,13})',
@@ -857,8 +860,26 @@ def normalize_unix_timestamp_seconds(timestamp_raw: Any) -> int:
     return max(0, timestamp)
 
 
+def safe_percent_decode_text(value_raw: Any, rounds_raw: int = 1) -> str:
+    value = str(value_raw or "")
+    if not value:
+        return ""
+    rounds = max(1, min(3, int(rounds_raw or 1)))
+
+    for _ in range(rounds):
+        next_value = re.sub(
+            r"%([0-9a-fA-F]{2})",
+            lambda m: chr(int(m.group(1), 16)),
+            value,
+        )
+        if next_value == value:
+            break
+        value = next_value
+    return value
+
+
 def normalize_facebook_payload_text(raw: Any) -> str:
-    return (
+    normalized = (
         str(raw or "")
         .replace("\\/", "/")
         .replace("\\u002f", "/")
@@ -866,7 +887,27 @@ def normalize_facebook_payload_text(raw: Any) -> str:
         .replace("\\u003d", "=")
         .replace("\\u0026", "&")
         .replace("\\u003f", "?")
+        .replace("\\x2f", "/")
+        .replace("\\x3a", ":")
+        .replace("\\x3d", "=")
+        .replace("\\x26", "&")
+        .replace("\\x3f", "?")
+        .replace("&#x2f;", "/")
+        .replace("&#x3a;", ":")
+        .replace("&#x3d;", "=")
+        .replace("&#x26;", "&")
+        .replace("&#x3f;", "?")
+        .replace("&#47;", "/")
+        .replace("&#58;", ":")
+        .replace("&#61;", "=")
+        .replace("&#38;", "&")
+        .replace("&#63;", "?")
         .replace("&amp;", "&")
+        .replace("%253d", "%3d")
+        .replace("%253D", "%3D")
+        .replace("%2526", "%26")
+        .replace("%253f", "%3f")
+        .replace("%253F", "%3F")
         .replace("%3d", "=")
         .replace("%3D", "=")
         .replace("%26", "&")
@@ -874,6 +915,31 @@ def normalize_facebook_payload_text(raw: Any) -> str:
         .replace("%3F", "?")
         .replace("&quot;", '"')
     )
+    return safe_percent_decode_text(normalized, 2)
+
+
+def build_facebook_navigation_hint_headers(user_agent_raw: Any) -> Dict[str, str]:
+    user_agent = str(user_agent_raw or "").lower()
+    platform = '"Windows"'
+    mobile = "?0"
+
+    if "android" in user_agent:
+        platform = '"Android"'
+        mobile = "?1"
+    elif "iphone" in user_agent or "ipad" in user_agent or "ios" in user_agent:
+        platform = '"iOS"'
+        mobile = "?1"
+
+    return {
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "sec-ch-ua": '"Chromium";v="140", "Not.A/Brand";v="24", "Google Chrome";v="140"',
+        "sec-ch-ua-mobile": mobile,
+        "sec-ch-ua-platform": platform,
+        "Cache-Control": "max-age=0",
+    }
 
 
 def is_story_fbid_token(value_raw: Any) -> bool:
@@ -899,6 +965,50 @@ def build_latest_post_link(uid_raw: Any, post_id_raw: Any) -> str:
         encoded_uid = quote(uid, safe="")
         return f"https://www.facebook.com/story.php?story_fbid={encoded_story}&id={encoded_uid}"
     return f"https://www.facebook.com/{uid}/posts/{post_id}"
+
+
+def extract_facebook_post_id_from_url(url_raw: Any) -> str:
+    url = str(url_raw or "").strip()
+    if not url:
+        return ""
+
+    patterns = [
+        r"(?:^|[?&])story_fbid=([A-Za-z0-9_]{8,})",
+        r"(?:^|[?&])fbid=(\d{8,})",
+        r"/posts/([A-Za-z0-9_]{8,})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url, flags=re.I)
+        if not match:
+            continue
+        post_id = str(match.group(1) or "").strip()
+        if is_latest_post_id_token(post_id):
+            return post_id
+    return ""
+
+
+def extract_facebook_post_url_from_html(html_raw: Any) -> str:
+    html = str(html_raw or "")
+    if not html:
+        return ""
+
+    patterns = [
+        r"https?://(?:www|m|mbasic)\.facebook\.com/(?:story\.php|permalink\.php)[^\"'\s<>]{0,700}",
+        r"https?://(?:www|m|mbasic)\.facebook\.com/[^/\"'\s<>?#]+/posts/[A-Za-z0-9_]{8,}[^\"'\s<>]{0,500}",
+        r"/(?:story\.php|permalink\.php)[^\"'\s<>]{0,700}",
+        r"/[^/\"'\s<>?#]+/posts/[A-Za-z0-9_]{8,}[^\"'\s<>]{0,500}",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html, flags=re.I)
+        if not match:
+            continue
+        raw = str(match.group(0) or "").strip()
+        if not raw:
+            continue
+        normalized = raw if raw.lower().startswith("http") else f"https://www.facebook.com{raw}"
+        if extract_facebook_post_id_from_url(normalized):
+            return normalized
+    return ""
 
 
 def build_facebook_latest_post_probe_urls(uid: str) -> List[str]:
@@ -948,6 +1058,10 @@ def parse_latest_post_from_html(html_raw: Any) -> Optional[Dict[str, Any]]:
                 post_id = str(match.group(1) or "").strip()
                 break
 
+    if not post_id:
+        post_url = extract_facebook_post_url_from_html(html)
+        post_id = extract_facebook_post_id_from_url(post_url)
+
     if not timestamp:
         for pattern in LATEST_POST_TIME_PATTERNS:
             match = re.search(pattern, html, flags=re.I)
@@ -966,6 +1080,7 @@ def parse_latest_post_from_html(html_raw: Any) -> Optional[Dict[str, Any]]:
 
 def build_latest_post_failure_reason(body_raw: Any, final_url_raw: Any, http_code_raw: Any) -> str:
     body = str(body_raw or "")
+    body_low = body.lower()
     final_url = str(final_url_raw or "")
     http_code = int(http_code_raw or 0)
 
@@ -975,6 +1090,35 @@ def build_latest_post_failure_reason(body_raw: Any, final_url_raw: Any, http_cod
         return "auth_wall"
     if contains_any(body, DIE_KEYWORDS):
         return "profile_unavailable"
+    if (
+        "unsupported-interstitial" in body_low
+        or "browser_unsupported" in body_low
+        or "this browser isn't supported" in body_low
+        or "this browser is not supported" in body_low
+        or "weblite_unsupported" in body_low
+    ):
+        return f"unsupported_browser_interstitial_http_{http_code or 0}"
+    if (
+        "sorry, something went wrong" in body_low
+        or "we're working on getting this fixed as soon as we can" in body_low
+        or "<title>error</title>" in body_low
+    ):
+        return f"facebook_error_page_http_{http_code or 0}"
+    if http_code == 200:
+        has_weblite_shell = (
+            "window.weblitebootloader" in body_low
+            or "appautostartdisabled" in body_low
+            or "pipe_no_www_response" in body_low
+        )
+        has_post_marker = (
+            "story_fbid" in body_low
+            or "/posts/" in body_low
+            or "permalink.php" in body_low
+            or "post_id" in body_low
+            or "legacy_fbid" in body_low
+        )
+        if has_weblite_shell and not has_post_marker:
+            return "timeline_shell_no_post_data_http_200"
     if http_code:
         return f"latest_post_not_found_http_{http_code}"
     return "latest_post_not_found"
@@ -1003,6 +1147,12 @@ def latest_post_failure_priority(reason_raw: Any, http_code_raw: Any) -> int:
         return 5000
     if reason.startswith("profile_unavailable"):
         return 4500
+    if reason.startswith("unsupported_browser_interstitial"):
+        return 4400
+    if reason.startswith("facebook_error_page"):
+        return 4300
+    if reason.startswith("timeline_shell_no_post_data"):
+        return 4200
     if reason.startswith("latest_post_not_found"):
         return 4000 if is_latest_post_no_post_http_code(http_code) else 3500
     if reason.startswith("auth_wall"):
@@ -1097,67 +1247,90 @@ async def fetch_latest_facebook_post_once(
 
     timeout = aiohttp.ClientTimeout(total=max(5.0, HTTP_TIMEOUT_SECONDS))
     normalized_session_cookies = normalize_cookies(session_cookies)
-    headers = {
-        "User-Agent": pick_user_agent(),
-        "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+    user_agents_raw = [
+        pick_user_agent(),
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+    ]
+    user_agents: List[str] = []
+    seen_ua = set()
+    for item in user_agents_raw:
+        ua = str(item or "").strip()
+        if not ua or ua in seen_ua:
+            continue
+        seen_ua.add(ua)
+        user_agents.append(ua)
+    if not user_agents:
+        user_agents.append(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+        )
+
+    headers_base = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": UID_PROBE_ACCEPT_LANGUAGE or "en-US,en;q=0.9,vi;q=0.8",
         "Referer": "https://www.facebook.com/",
+        "Upgrade-Insecure-Requests": "1",
     }
     probe_urls = build_facebook_latest_post_probe_urls(normalized_uid)
     attempts: List[Dict[str, Any]] = []
 
     async with aiohttp.ClientSession(timeout=timeout, cookies=normalized_session_cookies) as session:
         for probe_url in probe_urls:
-            try:
-                async with session.get(
-                    probe_url,
-                    headers=headers,
-                    proxy=proxy,
-                    allow_redirects=True,
-                ) as resp:
-                    http_code = int(resp.status or 0)
-                    body = await resp.text(errors="ignore")
-                    final_url = str(resp.url)
-                    parsed = parse_latest_post_from_html(body)
+            for user_agent in user_agents:
+                headers = dict(headers_base)
+                headers["User-Agent"] = user_agent
+                headers.update(build_facebook_navigation_hint_headers(user_agent))
+                try:
+                    async with session.get(
+                        probe_url,
+                        headers=headers,
+                        proxy=proxy,
+                        allow_redirects=True,
+                    ) as resp:
+                        http_code = int(resp.status or 0)
+                        body = await resp.text(errors="ignore")
+                        final_url = str(resp.url)
+                        parsed = parse_latest_post_from_html(body)
 
-                    if parsed:
-                        return {
-                            "ok": True,
-                            "uid": normalized_uid,
-                            "postId": parsed["postId"],
-                            "timestamp": parsed["timestamp"],
-                            "link": build_latest_post_link(normalized_uid, parsed["postId"]),
-                            "method": "with_cookie" if normalized_session_cookies else "no_cookie",
-                            "reason": "ok",
-                            "httpCode": http_code,
-                            "probeUrl": probe_url,
-                            "finalUrl": final_url,
-                            "probeAttempts": attempts + [
-                                {
-                                    "url": probe_url,
-                                    "httpCode": http_code,
-                                    "reason": "ok",
-                                }
-                            ],
-                        }
+                        if parsed:
+                            return {
+                                "ok": True,
+                                "uid": normalized_uid,
+                                "postId": parsed["postId"],
+                                "timestamp": parsed["timestamp"],
+                                "link": build_latest_post_link(normalized_uid, parsed["postId"]),
+                                "method": "with_cookie" if normalized_session_cookies else "no_cookie",
+                                "reason": "ok",
+                                "httpCode": http_code,
+                                "probeUrl": probe_url,
+                                "finalUrl": final_url,
+                                "probeAttempts": attempts + [
+                                    {
+                                        "url": probe_url,
+                                        "httpCode": http_code,
+                                        "reason": "ok",
+                                    }
+                                ],
+                            }
 
+                        attempts.append(
+                            {
+                                "url": probe_url,
+                                "httpCode": http_code,
+                                "reason": build_latest_post_failure_reason(body, final_url, http_code),
+                                "finalUrl": final_url,
+                            }
+                        )
+                except Exception as err:
                     attempts.append(
                         {
                             "url": probe_url,
-                            "httpCode": http_code,
-                            "reason": build_latest_post_failure_reason(body, final_url, http_code),
-                            "finalUrl": final_url,
+                            "httpCode": 0,
+                            "reason": f"exception:{err}",
+                            "finalUrl": "",
                         }
                     )
-            except Exception as err:
-                attempts.append(
-                    {
-                        "url": probe_url,
-                        "httpCode": 0,
-                        "reason": f"exception:{err}",
-                        "finalUrl": "",
-                    }
-                )
 
     selected_failure = choose_best_latest_post_failure(
         attempts,
