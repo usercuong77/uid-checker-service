@@ -149,7 +149,8 @@ LATEST_POST_ID_PATTERNS = [
     r'"story_fbid"\s*:\s*(\d{8,})',
     r'"legacy_fbid"\s*:\s*"([A-Za-z0-9_]{8,})"',
     r'"legacy_fbid"\s*:\s*(\d{8,})',
-    r'[?&]story_fbid=([A-Za-z0-9_]{8,})',
+    r'(?:^|[?&]|%3f|%26)story_fbid(?:=|%3d)([A-Za-z0-9_]{8,})',
+    r'permalink\.php(?:\?|%3f)[^"\'\s<>]*?(?:[?&]|%26)story_fbid(?:=|%3d)([A-Za-z0-9_]{8,})',
 ]
 LATEST_POST_TIME_PATTERNS = [
     r'"publish_time"\s*:\s*(\d{9,13})',
@@ -864,6 +865,13 @@ def normalize_facebook_payload_text(raw: Any) -> str:
         .replace("\\u003a", ":")
         .replace("\\u003d", "=")
         .replace("\\u0026", "&")
+        .replace("\\u003f", "?")
+        .replace("&amp;", "&")
+        .replace("%3d", "=")
+        .replace("%3D", "=")
+        .replace("%26", "&")
+        .replace("%3f", "?")
+        .replace("%3F", "?")
         .replace("&quot;", '"')
     )
 
