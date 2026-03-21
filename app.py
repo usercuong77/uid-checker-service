@@ -138,15 +138,23 @@ LATEST_POST_PAIR_PATTERNS = [
     r'"post_id"\s*:\s*"(\d+)"[\s\S]{0,2000}?"publish_time"\s*:\s*(\d{9,13})',
     r'"top_level_post_id"\s*:\s*"(\d+)"[\s\S]{0,2000}?"publish_time"\s*:\s*(\d{9,13})',
     r'"story_fbid"\s*:\s*"(\d+)"[\s\S]{0,2000}?"publish_time"\s*:\s*(\d{9,13})',
+    r'"legacy_fbid"\s*:\s*"(\d+)"[\s\S]{0,2000}?"publish_time"\s*:\s*(\d{9,13})',
 ]
 LATEST_POST_ID_PATTERNS = [
     r'"post_id"\s*:\s*"(\d+)"',
+    r'"post_id"\s*:\s*(\d+)',
     r'"top_level_post_id"\s*:\s*"(\d+)"',
+    r'"top_level_post_id"\s*:\s*(\d+)',
     r'"story_fbid"\s*:\s*"(\d+)"',
+    r'"story_fbid"\s*:\s*(\d+)',
+    r'"legacy_fbid"\s*:\s*"(\d+)"',
+    r'"legacy_fbid"\s*:\s*(\d+)',
+    r'[?&]story_fbid=(\d{8,})',
 ]
 LATEST_POST_TIME_PATTERNS = [
     r'"publish_time"\s*:\s*(\d{9,13})',
     r'"creation_time"\s*:\s*(\d{9,13})',
+    r'\bdata-utime\s*=\s*"(\d{9,13})"',
 ]
 
 
@@ -854,6 +862,8 @@ def normalize_facebook_payload_text(raw: Any) -> str:
         .replace("\\/", "/")
         .replace("\\u002f", "/")
         .replace("\\u003a", ":")
+        .replace("\\u003d", "=")
+        .replace("\\u0026", "&")
         .replace("&quot;", '"')
     )
 
