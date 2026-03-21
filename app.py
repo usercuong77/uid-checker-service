@@ -1931,6 +1931,181 @@ async def check_uid(
     return final_result
 
 
+def normalize_cookie_health_status(status_raw: Any) -> str:
+    value = str(status_raw or "").strip().upper()
+    if value in {"LIVE", "OK", "ACTIVE", "SUCCESS"}:
+        return "LIVE"
+    if value in {"DIE", "DEAD", "INVALID", "CHECKPOINT", "LOCKED"}:
+        return "DEAD"
+    if value in {"MISSING", "NONE", "EMPTY", "NOT_CONFIGURED", "COOKIE_NOT_CONFIGURED"}:
+        return "MISSING"
+    return "UNKNOWN"
+
+
+def pick_cookie_health_result(attempts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not attempts:
+        return {
+            "source": "no_cookie",
+            "status": "MISSING",
+            "reason": "cookie_not_configured",
+            "httpCode": 0,
+            "finalUrl": "",
+            "cookieCount": 0,
+            "configured": False,
+            "attempt": 0,
+        }
+
+    priorities = ("LIVE", "DEAD", "UNKNOWN", "MISSING")
+    for status in priorities:
+        for item in attempts:
+            if normalize_cookie_health_status(item.get("status")) == status:
+                return item
+
+    return attempts[-1]
+
+
+async def probe_cookie_health_once(
+    source: str,
+    session_cookies: Optional[Dict[str, str]] = None,
+    proxy: Optional[str] = None,
+) -> Dict[str, Any]:
+    normalized_session_cookies = normalize_cookies(session_cookies)
+    if not normalized_session_cookies:
+        return {
+            "source": source,
+            "configured": False,
+            "status": "MISSING",
+            "reason": "cookie_not_configured",
+            "httpCode": 0,
+            "finalUrl": "",
+            "cookieCount": 0,
+        }
+
+    timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS)
+    headers = {
+        "User-Agent": pick_user_agent(),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": UID_PROBE_ACCEPT_LANGUAGE or "en-US,en;q=0.9,vi;q=0.8",
+        "Referer": "https://www.facebook.com/",
+    }
+    probe_url = "https://m.facebook.com/me"
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, cookies=normalized_session_cookies) as session:
+            async with session.get(probe_url, headers=headers, proxy=proxy, allow_redirects=False) as resp:
+                code = int(resp.status or 0)
+                location = str(resp.headers.get("Location", ""))
+                final_url = str(resp.url)
+                body = await resp.text(errors="ignore")
+
+        body_low = (body or "").lower()
+        location_low = location.lower()
+        final_url_low = final_url.lower()
+        redirect_target = location or final_url
+
+        if (
+            "/login" in location_low
+            or "/checkpoint" in location_low
+            or "/recover" in location_low
+            or "/security" in location_low
+        ):
+            status = "DEAD"
+            reason = f"redirect:{redirect_target or '-'}"
+        elif has_checkpoint_signal(body_low) or "/checkpoint/" in final_url_low:
+            status = "DEAD"
+            reason = "checkpoint_signal"
+        elif is_auth_wall(body_low, redirect_target):
+            status = "DEAD"
+            reason = "auth_wall"
+        elif 200 <= code < 400:
+            status = "LIVE"
+            reason = "probe_ok"
+        else:
+            status = "UNKNOWN"
+            reason = f"http_{code}"
+
+        return {
+            "source": source,
+            "configured": True,
+            "status": status,
+            "reason": reason,
+            "httpCode": code,
+            "finalUrl": redirect_target,
+            "cookieCount": len(normalized_session_cookies),
+        }
+    except asyncio.TimeoutError:
+        return {
+            "source": source,
+            "configured": True,
+            "status": "UNKNOWN",
+            "reason": "timeout",
+            "httpCode": 0,
+            "finalUrl": "",
+            "cookieCount": len(normalized_session_cookies),
+        }
+    except Exception as err:
+        return {
+            "source": source,
+            "configured": True,
+            "status": "UNKNOWN",
+            "reason": f"error:{err}",
+            "httpCode": 0,
+            "finalUrl": "",
+            "cookieCount": len(normalized_session_cookies),
+        }
+
+
+async def check_cookie_health(
+    proxy: Optional[str] = None,
+    cookies: Optional[Dict[str, str]] = None,
+    cookies_pool: Optional[List[Dict[str, str]]] = None,
+) -> Dict[str, Any]:
+    candidates = build_cookie_candidates(cookies, cookies_pool)
+    attempts: List[Dict[str, Any]] = []
+
+    for idx, candidate in enumerate(candidates):
+        source = str(candidate.get("source") if isinstance(candidate, dict) else "") or f"cookie_{idx + 1}"
+        candidate_cookies = candidate.get("cookies") if isinstance(candidate, dict) else {}
+        current = await probe_cookie_health_once(source=source, session_cookies=candidate_cookies, proxy=proxy)
+        current["attempt"] = idx + 1
+        current["cookieCandidateTotal"] = len(candidates)
+        attempts.append(current)
+
+        if normalize_cookie_health_status(current.get("status")) == "LIVE":
+            break
+
+    selected = pick_cookie_health_result(attempts)
+    status = normalize_cookie_health_status(selected.get("status"))
+    configured = any(bool(item.get("configured")) and int(item.get("cookieCount", 0) or 0) > 0 for item in attempts)
+
+    return {
+        "ok": status == "LIVE",
+        "configured": configured,
+        "status": status,
+        "reason": str(selected.get("reason", "")),
+        "httpCode": int(selected.get("httpCode", 0) or 0),
+        "source": str(selected.get("source", "")),
+        "cookieCount": int(selected.get("cookieCount", 0) or 0),
+        "cookieAttempt": int(selected.get("attempt", 0) or 0),
+        "cookieCandidateTotal": len(candidates),
+        "cookieFallbackUsed": len(attempts) > 1,
+        "probeUrl": "https://m.facebook.com/me",
+        "finalUrl": str(selected.get("finalUrl", "")),
+        "attempts": [
+            {
+                "attempt": int(item.get("attempt", 0) or 0),
+                "source": str(item.get("source", "")),
+                "status": normalize_cookie_health_status(item.get("status")),
+                "reason": str(item.get("reason", "")),
+                "httpCode": int(item.get("httpCode", 0) or 0),
+                "cookieCount": int(item.get("cookieCount", 0) or 0),
+                "finalUrl": str(item.get("finalUrl", "")),
+            }
+            for item in attempts
+        ],
+    }
+
+
 def ensure_api_key(x_api_key: Optional[str]) -> None:
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="invalid_api_key")
@@ -1944,6 +2119,21 @@ async def health() -> Dict[str, Any]:
         "sepayRelayReady": bool(get_sepay_relay_target_url()),
         "telegramRelayReady": bool(get_telegram_relay_target_url()),
     }
+
+
+@app.get("/cookie-health")
+@app.get("/cookie-health/")
+async def cookie_health(proxy: Optional[str] = None, x_api_key: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    ensure_api_key(x_api_key)
+    return await check_cookie_health(proxy=proxy)
+
+
+@app.post("/cookie-health")
+@app.post("/cookie-health/")
+async def cookie_health_post(req: CheckRequest, x_api_key: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    ensure_api_key(x_api_key)
+    request_pool = req.cookiesPool or req.cookies_pool
+    return await check_cookie_health(req.proxy, req.cookies, request_pool)
 
 
 @app.get("/get-uid")
