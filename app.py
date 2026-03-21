@@ -947,6 +947,103 @@ def build_latest_post_failure_reason(body_raw: Any, final_url_raw: Any, http_cod
     return "latest_post_not_found"
 
 
+def is_latest_post_not_found_reason(reason_raw: Any) -> bool:
+    return str(reason_raw or "").lower().startswith("latest_post_not_found")
+
+
+def has_hard_latest_post_failure_reason(reason_raw: Any) -> bool:
+    reason = str(reason_raw or "").lower()
+    return reason.startswith("checkpoint") or reason.startswith("profile_unavailable")
+
+
+def is_latest_post_no_post_http_code(http_code_raw: Any) -> bool:
+    http_code = int(http_code_raw or 0)
+    return http_code in (200, 404)
+
+
+def latest_post_failure_priority(reason_raw: Any, http_code_raw: Any) -> int:
+    reason = str(reason_raw or "").lower()
+    http_code = int(http_code_raw or 0)
+    if not reason:
+        return 0
+    if reason.startswith("checkpoint"):
+        return 5000
+    if reason.startswith("profile_unavailable"):
+        return 4500
+    if reason.startswith("latest_post_not_found"):
+        return 4000 if is_latest_post_no_post_http_code(http_code) else 3500
+    if reason.startswith("auth_wall"):
+        return 3000
+    if reason.startswith("exception:"):
+        return 2000
+    return 1000
+
+
+def choose_best_latest_post_failure(
+    attempts_raw: Any,
+    fallback_raw: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    attempts = attempts_raw if isinstance(attempts_raw, list) else []
+    fallback = fallback_raw if isinstance(fallback_raw, dict) else {}
+    best_attempt: Optional[Dict[str, Any]] = None
+    best_score = -1
+
+    for attempt in attempts:
+        if not isinstance(attempt, dict):
+            continue
+        score = latest_post_failure_priority(attempt.get("reason"), attempt.get("httpCode"))
+        if score > best_score:
+            best_score = score
+            best_attempt = attempt
+
+    if not best_attempt:
+        return {
+            "reason": str(fallback.get("reason") or "latest_post_not_found"),
+            "httpCode": int(fallback.get("httpCode") or 0),
+            "url": str(fallback.get("url") or ""),
+            "finalUrl": str(fallback.get("finalUrl") or fallback.get("url") or ""),
+        }
+
+    return {
+        "reason": str(best_attempt.get("reason") or fallback.get("reason") or "latest_post_not_found"),
+        "httpCode": int(best_attempt.get("httpCode") or fallback.get("httpCode") or 0),
+        "url": str(best_attempt.get("url") or fallback.get("url") or ""),
+        "finalUrl": str(best_attempt.get("finalUrl") or best_attempt.get("url") or fallback.get("finalUrl") or fallback.get("url") or ""),
+    }
+
+
+def latest_post_result_priority(result_raw: Any) -> int:
+    result = result_raw if isinstance(result_raw, dict) else {}
+    if result.get("ok") and str(result.get("postId") or ""):
+        return 100000
+    return latest_post_failure_priority(result.get("reason"), result.get("httpCode"))
+
+
+def choose_better_latest_post_result(
+    current_raw: Any,
+    candidate_raw: Any,
+) -> Optional[Dict[str, Any]]:
+    current = current_raw if isinstance(current_raw, dict) else None
+    candidate = candidate_raw if isinstance(candidate_raw, dict) else None
+    if current is None:
+        return candidate
+    if candidate is None:
+        return current
+
+    current_score = latest_post_result_priority(current)
+    candidate_score = latest_post_result_priority(candidate)
+    if candidate_score > current_score:
+        return candidate
+    if candidate_score < current_score:
+        return current
+
+    current_http = int(current.get("httpCode") or 0)
+    candidate_http = int(candidate.get("httpCode") or 0)
+    if not current_http and candidate_http:
+        return candidate
+    return current
+
+
 async def fetch_latest_facebook_post_once(
     uid: str,
     proxy: Optional[str] = None,
@@ -1016,6 +1113,7 @@ async def fetch_latest_facebook_post_once(
                             "url": probe_url,
                             "httpCode": http_code,
                             "reason": build_latest_post_failure_reason(body, final_url, http_code),
+                            "finalUrl": final_url,
                         }
                     )
             except Exception as err:
@@ -1024,10 +1122,19 @@ async def fetch_latest_facebook_post_once(
                         "url": probe_url,
                         "httpCode": 0,
                         "reason": f"exception:{err}",
+                        "finalUrl": "",
                     }
                 )
 
-    last_attempt = attempts[-1] if attempts else {}
+    selected_failure = choose_best_latest_post_failure(
+        attempts,
+        {
+            "reason": "latest_post_not_found",
+            "httpCode": 0,
+            "url": probe_urls[0] if probe_urls else "",
+            "finalUrl": "",
+        },
+    )
     return {
         "ok": False,
         "uid": normalized_uid,
@@ -1035,8 +1142,10 @@ async def fetch_latest_facebook_post_once(
         "timestamp": 0,
         "link": "",
         "method": "with_cookie" if normalized_session_cookies else "no_cookie",
-        "reason": str(last_attempt.get("reason") or "latest_post_not_found"),
-        "httpCode": int(last_attempt.get("httpCode") or 0),
+        "reason": str(selected_failure.get("reason") or "latest_post_not_found"),
+        "httpCode": int(selected_failure.get("httpCode") or 0),
+        "probeUrl": str(selected_failure.get("url") or ""),
+        "finalUrl": str(selected_failure.get("finalUrl") or ""),
         "probeAttempts": attempts,
     }
 
@@ -1050,6 +1159,7 @@ async def get_latest_facebook_post(
     candidates = build_cookie_candidates(cookies, cookies_pool)
     cookie_attempts: List[Dict[str, Any]] = []
     final_result: Optional[Dict[str, Any]] = None
+    best_failure: Optional[Dict[str, Any]] = None
 
     for idx, candidate in enumerate(candidates):
         candidate_cookies = candidate.get("cookies") if isinstance(candidate, dict) else {}
@@ -1073,12 +1183,13 @@ async def get_latest_facebook_post(
                 "cookieCount": len(normalize_cookies(candidate_cookies if isinstance(candidate_cookies, dict) else None)),
             }
         )
-        final_result = current
         if current.get("ok"):
+            final_result = current
             break
+        best_failure = choose_better_latest_post_result(best_failure, current)
 
     if not final_result:
-        final_result = {
+        final_result = best_failure or {
             "ok": False,
             "uid": normalize_uid(uid),
             "postId": "",
