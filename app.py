@@ -3,7 +3,7 @@ import json
 import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 import aiohttp
 from fastapi import FastAPI, Header, HTTPException, Request, Response
@@ -135,21 +135,21 @@ UID_SCRAPE_PATTERNS = [
 ]
 
 LATEST_POST_PAIR_PATTERNS = [
-    r'"post_id"\s*:\s*"(\d+)"[\s\S]{0,2000}?"publish_time"\s*:\s*(\d{9,13})',
-    r'"top_level_post_id"\s*:\s*"(\d+)"[\s\S]{0,2000}?"publish_time"\s*:\s*(\d{9,13})',
-    r'"story_fbid"\s*:\s*"(\d+)"[\s\S]{0,2000}?"publish_time"\s*:\s*(\d{9,13})',
-    r'"legacy_fbid"\s*:\s*"(\d+)"[\s\S]{0,2000}?"publish_time"\s*:\s*(\d{9,13})',
+    r'"post_id"\s*:\s*"([A-Za-z0-9_]{8,})"[\s\S]{0,2000}?"publish_time"\s*:\s*(\d{9,13})',
+    r'"top_level_post_id"\s*:\s*"([A-Za-z0-9_]{8,})"[\s\S]{0,2000}?"publish_time"\s*:\s*(\d{9,13})',
+    r'"story_fbid"\s*:\s*"([A-Za-z0-9_]{8,})"[\s\S]{0,2000}?"publish_time"\s*:\s*(\d{9,13})',
+    r'"legacy_fbid"\s*:\s*"([A-Za-z0-9_]{8,})"[\s\S]{0,2000}?"publish_time"\s*:\s*(\d{9,13})',
 ]
 LATEST_POST_ID_PATTERNS = [
-    r'"post_id"\s*:\s*"(\d+)"',
-    r'"post_id"\s*:\s*(\d+)',
-    r'"top_level_post_id"\s*:\s*"(\d+)"',
-    r'"top_level_post_id"\s*:\s*(\d+)',
-    r'"story_fbid"\s*:\s*"(\d+)"',
-    r'"story_fbid"\s*:\s*(\d+)',
-    r'"legacy_fbid"\s*:\s*"(\d+)"',
-    r'"legacy_fbid"\s*:\s*(\d+)',
-    r'[?&]story_fbid=(\d{8,})',
+    r'"post_id"\s*:\s*"([A-Za-z0-9_]{8,})"',
+    r'"post_id"\s*:\s*(\d{8,})',
+    r'"top_level_post_id"\s*:\s*"([A-Za-z0-9_]{8,})"',
+    r'"top_level_post_id"\s*:\s*(\d{8,})',
+    r'"story_fbid"\s*:\s*"([A-Za-z0-9_]{8,})"',
+    r'"story_fbid"\s*:\s*(\d{8,})',
+    r'"legacy_fbid"\s*:\s*"([A-Za-z0-9_]{8,})"',
+    r'"legacy_fbid"\s*:\s*(\d{8,})',
+    r'[?&]story_fbid=([A-Za-z0-9_]{8,})',
 ]
 LATEST_POST_TIME_PATTERNS = [
     r'"publish_time"\s*:\s*(\d{9,13})',
@@ -868,6 +868,31 @@ def normalize_facebook_payload_text(raw: Any) -> str:
     )
 
 
+def is_story_fbid_token(value_raw: Any) -> bool:
+    return bool(re.fullmatch(r"pfbid[a-zA-Z0-9_]+", str(value_raw or "").strip()))
+
+
+def is_latest_post_id_token(value_raw: Any) -> bool:
+    value = str(value_raw or "").strip()
+    if not value:
+        return False
+    if re.fullmatch(r"\d{8,}", value):
+        return True
+    return is_story_fbid_token(value)
+
+
+def build_latest_post_link(uid_raw: Any, post_id_raw: Any) -> str:
+    uid = str(uid_raw or "").strip()
+    post_id = str(post_id_raw or "").strip()
+    if not uid or not post_id:
+        return ""
+    if is_story_fbid_token(post_id):
+        encoded_story = quote(post_id, safe="")
+        encoded_uid = quote(uid, safe="")
+        return f"https://www.facebook.com/story.php?story_fbid={encoded_story}&id={encoded_uid}"
+    return f"https://www.facebook.com/{uid}/posts/{post_id}"
+
+
 def build_facebook_latest_post_probe_urls(uid: str) -> List[str]:
     normalized_uid = normalize_uid(uid)
     if not normalized_uid:
@@ -922,7 +947,7 @@ def parse_latest_post_from_html(html_raw: Any) -> Optional[Dict[str, Any]]:
                 timestamp = normalize_unix_timestamp_seconds(match.group(1))
                 break
 
-    if not re.fullmatch(r"\d{8,}", post_id or ""):
+    if not is_latest_post_id_token(post_id):
         return None
 
     return {
@@ -1093,7 +1118,7 @@ async def fetch_latest_facebook_post_once(
                             "uid": normalized_uid,
                             "postId": parsed["postId"],
                             "timestamp": parsed["timestamp"],
-                            "link": f"https://www.facebook.com/{normalized_uid}/posts/{parsed['postId']}",
+                            "link": build_latest_post_link(normalized_uid, parsed["postId"]),
                             "method": "with_cookie" if normalized_session_cookies else "no_cookie",
                             "reason": "ok",
                             "httpCode": http_code,
