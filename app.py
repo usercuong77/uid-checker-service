@@ -134,6 +134,21 @@ UID_SCRAPE_PATTERNS = [
     r'fb://profile/(\d{8,20})',
 ]
 
+LATEST_POST_PAIR_PATTERNS = [
+    r'"post_id"\s*:\s*"(\d+)"[\s\S]{0,2000}?"publish_time"\s*:\s*(\d{9,13})',
+    r'"top_level_post_id"\s*:\s*"(\d+)"[\s\S]{0,2000}?"publish_time"\s*:\s*(\d{9,13})',
+    r'"story_fbid"\s*:\s*"(\d+)"[\s\S]{0,2000}?"publish_time"\s*:\s*(\d{9,13})',
+]
+LATEST_POST_ID_PATTERNS = [
+    r'"post_id"\s*:\s*"(\d+)"',
+    r'"top_level_post_id"\s*:\s*"(\d+)"',
+    r'"story_fbid"\s*:\s*"(\d+)"',
+]
+LATEST_POST_TIME_PATTERNS = [
+    r'"publish_time"\s*:\s*(\d{9,13})',
+    r'"creation_time"\s*:\s*(\d{9,13})',
+]
+
 
 class CheckRequest(BaseModel):
     uid: Optional[str] = Field(default=None)
@@ -687,6 +702,10 @@ def load_default_cookies() -> Dict[str, str]:
     # Primary: JSON in one env var (recommended).
     raw_json = os.getenv("UID_CHECKER_FB_COOKIES_JSON", "").strip() or os.getenv("FB_COOKIES_JSON", "").strip()
     cookies = parse_cookie_json(raw_json)
+    if not cookies:
+        legacy_pool = parse_cookie_pool_json(raw_json)
+        if legacy_pool:
+            cookies = dict(legacy_pool[0])
 
     # Secondary: allow direct c_user/xs env vars.
     c_user = os.getenv("UID_CHECKER_FB_C_USER", "").strip()
@@ -701,7 +720,14 @@ def load_default_cookies() -> Dict[str, str]:
 
 def load_default_cookie_pool() -> List[Dict[str, str]]:
     raw_json = os.getenv("UID_CHECKER_FB_COOKIES_POOL_JSON", "").strip() or os.getenv("FB_COOKIES_POOL_JSON", "").strip()
-    return parse_cookie_pool_json(raw_json)
+    pool = parse_cookie_pool_json(raw_json)
+    if pool:
+        return pool
+
+    # Backward-compatible fallback: some deployments accidentally put a cookie
+    # array into UID_CHECKER_FB_COOKIES_JSON instead of *_POOL_JSON.
+    legacy_json = os.getenv("UID_CHECKER_FB_COOKIES_JSON", "").strip() or os.getenv("FB_COOKIES_JSON", "").strip()
+    return parse_cookie_pool_json(legacy_json)
 
 
 DEFAULT_FB_COOKIES = load_default_cookies()
@@ -809,6 +835,253 @@ def build_facebook_probe_urls(url_raw: Any) -> List[str]:
         seen.add(key)
         out.append(key)
     return out
+
+
+def normalize_unix_timestamp_seconds(timestamp_raw: Any) -> int:
+    try:
+        timestamp = int(float(timestamp_raw or 0))
+    except Exception:
+        timestamp = 0
+
+    if timestamp > 1000000000000:
+        timestamp = timestamp // 1000
+    return max(0, timestamp)
+
+
+def normalize_facebook_payload_text(raw: Any) -> str:
+    return (
+        str(raw or "")
+        .replace("\\/", "/")
+        .replace("\\u002f", "/")
+        .replace("\\u003a", ":")
+        .replace("&quot;", '"')
+    )
+
+
+def build_facebook_latest_post_probe_urls(uid: str) -> List[str]:
+    normalized_uid = normalize_uid(uid)
+    if not normalized_uid:
+        return []
+
+    urls = [
+        f"https://www.facebook.com/profile.php?id={normalized_uid}&sk=posts",
+        f"https://www.facebook.com/profile.php?id={normalized_uid}",
+        f"https://www.facebook.com/{normalized_uid}",
+        f"https://m.facebook.com/profile.php?id={normalized_uid}&v=timeline",
+        f"https://mbasic.facebook.com/profile.php?id={normalized_uid}&v=timeline",
+    ]
+
+    out: List[str] = []
+    seen = set()
+    for item in urls:
+        key = str(item or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+def parse_latest_post_from_html(html_raw: Any) -> Optional[Dict[str, Any]]:
+    html = normalize_facebook_payload_text(html_raw)
+    if not html:
+        return None
+
+    post_id = ""
+    timestamp = 0
+
+    for pattern in LATEST_POST_PAIR_PATTERNS:
+        match = re.search(pattern, html, flags=re.I)
+        if not match:
+            continue
+        post_id = str(match.group(1) or "").strip()
+        timestamp = normalize_unix_timestamp_seconds(match.group(2))
+        break
+
+    if not post_id:
+        for pattern in LATEST_POST_ID_PATTERNS:
+            match = re.search(pattern, html, flags=re.I)
+            if match:
+                post_id = str(match.group(1) or "").strip()
+                break
+
+    if not timestamp:
+        for pattern in LATEST_POST_TIME_PATTERNS:
+            match = re.search(pattern, html, flags=re.I)
+            if match:
+                timestamp = normalize_unix_timestamp_seconds(match.group(1))
+                break
+
+    if not re.fullmatch(r"\d{8,}", post_id or ""):
+        return None
+
+    return {
+        "postId": post_id,
+        "timestamp": timestamp,
+    }
+
+
+def build_latest_post_failure_reason(body_raw: Any, final_url_raw: Any, http_code_raw: Any) -> str:
+    body = str(body_raw or "")
+    final_url = str(final_url_raw or "")
+    http_code = int(http_code_raw or 0)
+
+    if has_checkpoint_signal(body) or "/checkpoint/" in final_url.lower():
+        return "checkpoint_detected"
+    if is_auth_wall(body, final_url):
+        return "auth_wall"
+    if contains_any(body, DIE_KEYWORDS):
+        return "profile_unavailable"
+    if http_code:
+        return f"latest_post_not_found_http_{http_code}"
+    return "latest_post_not_found"
+
+
+async def fetch_latest_facebook_post_once(
+    uid: str,
+    proxy: Optional[str] = None,
+    session_cookies: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    normalized_uid = normalize_uid(uid)
+    if not normalized_uid:
+        return {
+            "ok": False,
+            "uid": "",
+            "postId": "",
+            "timestamp": 0,
+            "link": "",
+            "method": "invalid_uid",
+            "reason": "invalid_uid",
+            "httpCode": 0,
+        }
+
+    timeout = aiohttp.ClientTimeout(total=max(5.0, HTTP_TIMEOUT_SECONDS))
+    normalized_session_cookies = normalize_cookies(session_cookies)
+    headers = {
+        "User-Agent": pick_user_agent(),
+        "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+        "Accept-Language": UID_PROBE_ACCEPT_LANGUAGE or "en-US,en;q=0.9,vi;q=0.8",
+        "Referer": "https://www.facebook.com/",
+    }
+    probe_urls = build_facebook_latest_post_probe_urls(normalized_uid)
+    attempts: List[Dict[str, Any]] = []
+
+    async with aiohttp.ClientSession(timeout=timeout, cookies=normalized_session_cookies) as session:
+        for probe_url in probe_urls:
+            try:
+                async with session.get(
+                    probe_url,
+                    headers=headers,
+                    proxy=proxy,
+                    allow_redirects=True,
+                ) as resp:
+                    http_code = int(resp.status or 0)
+                    body = await resp.text(errors="ignore")
+                    final_url = str(resp.url)
+                    parsed = parse_latest_post_from_html(body)
+
+                    if parsed:
+                        return {
+                            "ok": True,
+                            "uid": normalized_uid,
+                            "postId": parsed["postId"],
+                            "timestamp": parsed["timestamp"],
+                            "link": f"https://www.facebook.com/{normalized_uid}/posts/{parsed['postId']}",
+                            "method": "with_cookie" if normalized_session_cookies else "no_cookie",
+                            "reason": "ok",
+                            "httpCode": http_code,
+                            "probeUrl": probe_url,
+                            "finalUrl": final_url,
+                            "probeAttempts": attempts + [
+                                {
+                                    "url": probe_url,
+                                    "httpCode": http_code,
+                                    "reason": "ok",
+                                }
+                            ],
+                        }
+
+                    attempts.append(
+                        {
+                            "url": probe_url,
+                            "httpCode": http_code,
+                            "reason": build_latest_post_failure_reason(body, final_url, http_code),
+                        }
+                    )
+            except Exception as err:
+                attempts.append(
+                    {
+                        "url": probe_url,
+                        "httpCode": 0,
+                        "reason": f"exception:{err}",
+                    }
+                )
+
+    last_attempt = attempts[-1] if attempts else {}
+    return {
+        "ok": False,
+        "uid": normalized_uid,
+        "postId": "",
+        "timestamp": 0,
+        "link": "",
+        "method": "with_cookie" if normalized_session_cookies else "no_cookie",
+        "reason": str(last_attempt.get("reason") or "latest_post_not_found"),
+        "httpCode": int(last_attempt.get("httpCode") or 0),
+        "probeAttempts": attempts,
+    }
+
+
+async def get_latest_facebook_post(
+    uid: str,
+    proxy: Optional[str] = None,
+    cookies: Optional[Dict[str, str]] = None,
+    cookies_pool: Optional[List[Dict[str, str]]] = None,
+) -> Dict[str, Any]:
+    candidates = build_cookie_candidates(cookies, cookies_pool)
+    cookie_attempts: List[Dict[str, Any]] = []
+    final_result: Optional[Dict[str, Any]] = None
+
+    for idx, candidate in enumerate(candidates):
+        candidate_cookies = candidate.get("cookies") if isinstance(candidate, dict) else {}
+        source = str(candidate.get("source") if isinstance(candidate, dict) else "") or f"cookie_{idx + 1}"
+
+        current = await fetch_latest_facebook_post_once(
+            uid=uid,
+            proxy=proxy,
+            session_cookies=candidate_cookies,
+        )
+        current["cookieSource"] = source
+        current["cookieAttempt"] = idx + 1
+        current["cookieCandidateTotal"] = len(candidates)
+        cookie_attempts.append(
+            {
+                "attempt": idx + 1,
+                "source": source,
+                "ok": bool(current.get("ok")),
+                "reason": str(current.get("reason") or ""),
+                "httpCode": int(current.get("httpCode") or 0),
+                "cookieCount": len(normalize_cookies(candidate_cookies if isinstance(candidate_cookies, dict) else None)),
+            }
+        )
+        final_result = current
+        if current.get("ok"):
+            break
+
+    if not final_result:
+        final_result = {
+            "ok": False,
+            "uid": normalize_uid(uid),
+            "postId": "",
+            "timestamp": 0,
+            "link": "",
+            "method": "no_cookie",
+            "reason": "latest_post_not_found",
+            "httpCode": 0,
+        }
+
+    final_result["cookieAttempts"] = cookie_attempts
+    final_result["cookieFallbackUsed"] = len(cookie_attempts) > 1
+    return final_result
 
 
 FALLBACK_UID_PROBE_USER_AGENTS = [
@@ -1411,6 +1684,33 @@ async def check(req: CheckRequest, x_api_key: Optional[str] = Header(default=Non
     result = await check_uid(uid, req.proxy, req.cookies, request_pool)
     result["ok"] = True
     return result
+
+
+@app.post("/latest-post")
+@app.post("/latest-post/")
+@app.post("/checkpost")
+async def latest_post(req: CheckRequest, x_api_key: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    ensure_api_key(x_api_key)
+
+    raw_url = str(req.url or "").strip()
+    uid = normalize_uid(req.uid) or extract_uid_from_url(raw_url)
+    if not uid and raw_url:
+        uid = await resolve_uid_from_facebook_url(raw_url, req.proxy)
+
+    if not uid:
+        return {
+            "ok": False,
+            "uid": "",
+            "postId": "",
+            "timestamp": 0,
+            "link": "",
+            "method": "invalid_uid",
+            "reason": "invalid_uid",
+            "httpCode": 0,
+        }
+
+    request_pool = req.cookiesPool or req.cookies_pool
+    return await get_latest_facebook_post(uid, req.proxy, req.cookies, request_pool)
 
 
 @app.post("/live-check")

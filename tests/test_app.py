@@ -78,6 +78,47 @@ class CookieHelperTests(unittest.TestCase):
         self.assertTrue(checker_app.should_try_next_cookie(auth_wall))
         self.assertFalse(checker_app.should_try_next_cookie(stable_live))
 
+    def test_load_default_cookies_accepts_array_json_legacy_shape(self):
+        with patch.dict(
+            checker_app.os.environ,
+            {
+                "UID_CHECKER_FB_COOKIES_JSON": '[{"c_user":"1000","xs":"abc"},{"c_user":"2000","xs":"def"}]',
+                "UID_CHECKER_FB_C_USER": "",
+                "UID_CHECKER_FB_XS": "",
+            },
+            clear=False,
+        ):
+            self.assertEqual(checker_app.load_default_cookies(), {"c_user": "1000", "xs": "abc"})
+
+    def test_load_default_cookie_pool_falls_back_to_json_env_array(self):
+        with patch.dict(
+            checker_app.os.environ,
+            {
+                "UID_CHECKER_FB_COOKIES_POOL_JSON": "",
+                "FB_COOKIES_POOL_JSON": "",
+                "UID_CHECKER_FB_COOKIES_JSON": '[{"c_user":"1000","xs":"abc"},{"c_user":"2000","xs":"def"}]',
+            },
+            clear=False,
+        ):
+            self.assertEqual(
+                checker_app.load_default_cookie_pool(),
+                [{"c_user": "1000", "xs": "abc"}, {"c_user": "2000", "xs": "def"}],
+            )
+
+
+class LatestPostHelperTests(unittest.TestCase):
+    def test_parse_latest_post_from_html_extracts_post_and_time(self):
+        parsed = checker_app.parse_latest_post_from_html(
+            '{"post_id":"123456789012345","publish_time":1712345678}'
+        )
+        self.assertEqual(
+            parsed,
+            {
+                "postId": "123456789012345",
+                "timestamp": 1712345678,
+            },
+        )
+
 
 class SepayRelayHelperTests(unittest.TestCase):
     def test_build_forward_url_preserves_existing_query(self):
@@ -205,6 +246,91 @@ class EndpointLogicTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["status"], "LIVE")
         self.assertEqual(result["uid"], "100041775009544")
+
+    async def test_get_latest_facebook_post_retries_cookie_pool_until_success(self):
+        mocked_fetch = AsyncMock(
+            side_effect=[
+                {
+                    "ok": False,
+                    "uid": "100041775009544",
+                    "postId": "",
+                    "timestamp": 0,
+                    "link": "",
+                    "method": "with_cookie",
+                    "reason": "latest_post_not_found_http_404",
+                    "httpCode": 404,
+                },
+                {
+                    "ok": True,
+                    "uid": "100041775009544",
+                    "postId": "123456789012345",
+                    "timestamp": 1712345678,
+                    "link": "https://www.facebook.com/100041775009544/posts/123456789012345",
+                    "method": "with_cookie",
+                    "reason": "ok",
+                    "httpCode": 200,
+                },
+            ]
+        )
+
+        with patch.object(checker_app, "fetch_latest_facebook_post_once", mocked_fetch):
+            result = await checker_app.get_latest_facebook_post(
+                "100041775009544",
+                None,
+                {"c_user": "1000", "xs": "req"},
+                [{"c_user": "2000", "xs": "pool"}],
+            )
+
+        self.assertEqual(mocked_fetch.await_count, 2)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["cookieSource"], "request_pool_1")
+        self.assertTrue(result["cookieFallbackUsed"])
+
+    async def test_latest_post_invalid_uid_returns_error(self):
+        req = checker_app.CheckRequest(uid="not-a-valid-uid")
+        result = await checker_app.latest_post(req, x_api_key=None)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "invalid_uid")
+        self.assertEqual(result["httpCode"], 0)
+
+    async def test_latest_post_calls_fetcher_with_resolved_uid_and_cookie_alias(self):
+        req = checker_app.CheckRequest(
+            uid=None,
+            url="https://facebook.com/test.username",
+            proxy="http://proxy.local:8080",
+            cookies={"c_user": "1000", "xs": "abc"},
+            cookies_pool=[{"c_user": "2000", "xs": "pool"}],
+        )
+        mocked_resolve = AsyncMock(return_value="100041775009544")
+        mocked_latest = AsyncMock(
+            return_value={
+                "ok": True,
+                "uid": "100041775009544",
+                "postId": "123456789012345",
+                "timestamp": 1712345678,
+                "link": "https://www.facebook.com/100041775009544/posts/123456789012345",
+                "method": "with_cookie",
+                "reason": "ok",
+                "httpCode": 200,
+            }
+        )
+
+        with patch.object(checker_app, "API_KEY", "secret-key"), patch.object(
+            checker_app,
+            "resolve_uid_from_facebook_url",
+            mocked_resolve,
+        ), patch.object(checker_app, "get_latest_facebook_post", mocked_latest):
+            result = await checker_app.latest_post(req, x_api_key="secret-key")
+
+        mocked_resolve.assert_awaited_once_with("https://facebook.com/test.username", "http://proxy.local:8080")
+        mocked_latest.assert_awaited_once_with(
+            "100041775009544",
+            "http://proxy.local:8080",
+            {"c_user": "1000", "xs": "abc"},
+            [{"c_user": "2000", "xs": "pool"}],
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["postId"], "123456789012345")
 
     async def test_forward_sepay_webhook_requires_target_url(self):
         with self.assertRaises(checker_app.HTTPException) as ctx:

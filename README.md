@@ -88,6 +88,15 @@ curl -X POST http://127.0.0.1:8080/check ^
   -d "{\"uid\":\"100041775009544\",\"cookiesPool\":[{\"c_user\":\"1000xxxxxxxx\",\"xs\":\"xx:xxxxxxxxxxxxxxxx\"},{\"c_user\":\"1000yyyyyyyy\",\"xs\":\"yy:yyyyyyyyyyyyyyyy\"}]}"
 ```
 
+Lay bai Facebook moi nhat:
+
+```bash
+curl -X POST http://127.0.0.1:8080/latest-post ^
+  -H "Content-Type: application/json" ^
+  -H "X-Api-Key: your_secret_key" ^
+  -d "{\"uid\":\"100041775009544\"}"
+```
+
 Check TikTok LIVE:
 
 ```bash
@@ -114,6 +123,7 @@ Mo `weblamquoccuong/Bot/apps-script/case_manager_bot.gs`, trong `CONFIG`:
 - `externalCheckerApiKey`: key trung voi `UID_CHECKER_API_KEY`
 
 Neu `externalCheckerUrl` de rong, bot se bo qua Python service va dung logic check noi bo.
+Neu `externalCheckerUrl` dang tro vao `/check`, Apps Script se tu suy ra them endpoint `/latest-post` cho lenh `/checkpost`.
 
 ## 4) Cau hinh cookie tren Render (khuyen nghi)
 
@@ -138,7 +148,11 @@ Vao Render -> Service -> Environment:
 Ghi chu:
 
 - Service se thu cookie theo thu tu: cookie tu request -> cookiesPool tu request -> cookie pool tren env -> cookie default tren env.
+- Neu ban lo tay dan mang JSON array vao `UID_CHECKER_FB_COOKIES_JSON`, service van se co gang doc cookie dau tien va cookie pool tu mang do. Tuy vay, cach dung dung van la:
+  - `UID_CHECKER_FB_COOKIES_JSON` cho 1 cookie object
+  - `UID_CHECKER_FB_COOKIES_POOL_JSON` cho nhieu cookie object
 - De nhanh, service chi check 1 cookie dau tien. Chi fallback sang cookie tiep theo neu ket qua cho thay dau hieu cookie loi/auth wall/checkpoint.
+- Rieng endpoint `/latest-post`, service se thu tiep cookie pool den khi lay duoc bai moi nhat hoac het danh sach cookie.
 - Cookie co the het han/checkpoint, can cap nhat dinh ky.
 - Khong commit cookie vao GitHub.
 
