@@ -1,4 +1,5 @@
 import asyncio
+import html as html_lib
 import json
 import os
 import re
@@ -1010,6 +1011,164 @@ def extract_facebook_post_url_from_html(html_raw: Any) -> str:
     return ""
 
 
+def decode_facebook_json_text(value_raw: Any) -> str:
+    value = str(value_raw or "")
+    if not value:
+        return ""
+    try:
+        return str(json.loads(f'"{value}"'))
+    except Exception:
+        return (
+            value.replace("\\/", "/")
+            .replace('\\"', '"')
+            .replace("\\n", "\n")
+            .replace("\\r", "\n")
+            .replace("\\t", " ")
+        )
+
+
+def clean_facebook_post_content(value_raw: Any) -> str:
+    if value_raw is None or isinstance(value_raw, (dict, list, tuple, set)):
+        return ""
+
+    text = html_lib.unescape(str(value_raw or ""))
+    if not text:
+        return ""
+
+    text = re.sub(r"<script[\s\S]*?</script>", " ", text, flags=re.I)
+    text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html_lib.unescape(text)
+    text = text.replace("\x00", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = text.strip()
+    if not text:
+        return ""
+
+    lowered = text.lower()
+    generic_exact = {
+        "facebook",
+        "log in",
+        "log into facebook",
+        "log in or sign up to view",
+        "see posts, photos and more on facebook.",
+        "see posts, photos and more on facebook",
+    }
+    if lowered in generic_exact:
+        return ""
+
+    generic_prefixes = (
+        "log in or sign up to view",
+        "see posts, photos and more on facebook",
+        "you must log in",
+    )
+    if len(text) < 180 and any(lowered.startswith(item) for item in generic_prefixes):
+        return ""
+
+    return text
+
+
+def extract_meta_content_from_html(html_raw: Any, attr_name: str, attr_value: str) -> str:
+    html = str(html_raw or "")
+    if not html:
+        return ""
+
+    if BeautifulSoup:
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            node = soup.find("meta", attrs={attr_name: attr_value})
+            if node and node.get("content"):
+                return clean_facebook_post_content(node.get("content"))
+        except Exception:
+            pass
+
+    escaped_name = re.escape(attr_name)
+    escaped_value = re.escape(attr_value)
+    patterns = [
+        rf'<meta[^>]+\b{escaped_name}=["\']{escaped_value}["\'][^>]+\bcontent=["\']([^"\']*)["\'][^>]*>',
+        rf'<meta[^>]+\bcontent=["\']([^"\']*)["\'][^>]+\b{escaped_name}=["\']{escaped_value}["\'][^>]*>',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html, flags=re.I)
+        if match:
+            return clean_facebook_post_content(match.group(1))
+    return ""
+
+
+def extract_json_content_candidates_from_text(text_raw: Any) -> List[str]:
+    text = str(text_raw or "")
+    if not text:
+        return []
+
+    candidates: List[str] = []
+    patterns = [
+        r'"message"\s*:\s*\{[^{}]{0,4000}?"text"\s*:\s*"((?:\\.|[^"\\]){1,5000})"',
+        r'"post_message"\s*:\s*\{[^{}]{0,4000}?"text"\s*:\s*"((?:\\.|[^"\\]){1,5000})"',
+        r'"creation_story"\s*:\s*\{[^{}]{0,5000}?"text"\s*:\s*"((?:\\.|[^"\\]){1,5000})"',
+        r'"message"\s*:\s*"((?:\\.|[^"\\]){1,5000})"',
+        r'"text"\s*:\s*"((?:\\.|[^"\\]){20,5000})"',
+        r'"story"\s*:\s*"((?:\\.|[^"\\]){20,5000})"',
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, flags=re.I):
+            cleaned = clean_facebook_post_content(decode_facebook_json_text(match.group(1)))
+            if cleaned and cleaned not in candidates:
+                candidates.append(cleaned)
+            if len(candidates) >= 12:
+                return candidates
+    return candidates
+
+
+def extract_latest_post_content_from_html(html_raw: Any, post_id_raw: Any = "") -> str:
+    html = str(html_raw or "")
+    if not html:
+        return ""
+
+    normalized = normalize_facebook_payload_text(html)
+    post_id = str(post_id_raw or "").strip()
+    windows: List[str] = []
+
+    if post_id:
+        for match in re.finditer(re.escape(post_id), normalized, flags=re.I):
+            start = max(0, match.start() - 8000)
+            end = min(len(normalized), match.end() + 14000)
+            windows.append(normalized[start:end])
+            if len(windows) >= 4:
+                break
+
+    windows.append(normalized[:60000])
+
+    for window in windows:
+        for candidate in extract_json_content_candidates_from_text(window):
+            if candidate:
+                return candidate
+
+    meta_candidates = [
+        extract_meta_content_from_html(html, "property", "og:description"),
+        extract_meta_content_from_html(html, "name", "description"),
+        extract_meta_content_from_html(html, "property", "twitter:description"),
+    ]
+    for candidate in meta_candidates:
+        cleaned = clean_facebook_post_content(candidate)
+        if cleaned:
+            return cleaned
+
+    if BeautifulSoup:
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            for tag_name in ("p", "div", "span"):
+                for node in soup.find_all(tag_name, limit=80):
+                    cleaned = clean_facebook_post_content(node.get_text(" ", strip=True))
+                    if cleaned and len(cleaned) >= 20:
+                        return cleaned
+        except Exception:
+            pass
+
+    return ""
+
+
 def build_facebook_latest_post_probe_urls(uid: str) -> List[str]:
     normalized_uid = normalize_uid(uid)
     if not normalized_uid:
@@ -1315,12 +1474,15 @@ async def fetch_latest_facebook_post_once(
                         http_success = 200 <= http_code < 400
 
                         if has_post_candidate and has_evidence and http_success:
+                            post_content = extract_latest_post_content_from_html(body, parsed["postId"])
                             return {
                                 "ok": True,
                                 "uid": normalized_uid,
                                 "postId": parsed["postId"],
                                 "timestamp": parsed["timestamp"],
                                 "link": build_latest_post_link(normalized_uid, parsed["postId"]),
+                                "content": post_content,
+                                "postContent": post_content,
                                 "method": "with_cookie" if normalized_session_cookies else "no_cookie",
                                 "reason": "ok",
                                 "httpCode": http_code,
