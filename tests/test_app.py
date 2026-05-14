@@ -332,6 +332,26 @@ class EndpointLogicTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["postId"], "123456789012345")
 
+    async def test_latest_post_total_timeout_returns_soft_failure(self):
+        async def slow_latest(*args, **kwargs):
+            await checker_app.asyncio.sleep(1)
+            return {"ok": True}
+
+        req = checker_app.CheckRequest(uid="100041775009544")
+        with patch.object(checker_app, "get_latest_post_total_timeout_seconds", return_value=0.01), patch.object(
+            checker_app,
+            "get_latest_facebook_post",
+            slow_latest,
+        ):
+            result = await checker_app.latest_post(req, x_api_key=None)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["uid"], "100041775009544")
+        self.assertEqual(result["reason"], "latest_post_timeout")
+        self.assertEqual(result["method"], "latest_post_timeout")
+        self.assertEqual(result["httpCode"], 0)
+        self.assertEqual(result["timeoutSeconds"], 0.01)
+
     async def test_forward_sepay_webhook_requires_target_url(self):
         with self.assertRaises(checker_app.HTTPException) as ctx:
             await checker_app.forward_sepay_webhook("POST", "", b"{}", {}, "")

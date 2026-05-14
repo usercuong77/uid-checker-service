@@ -37,6 +37,7 @@ except Exception:
 APP_NAME = "uid-checker-service"
 API_KEY = os.getenv("UID_CHECKER_API_KEY", "").strip()
 HTTP_TIMEOUT_SECONDS = float(os.getenv("UID_CHECKER_TIMEOUT", "10"))
+LATEST_POST_TOTAL_TIMEOUT_SECONDS = float(os.getenv("LATEST_POST_TOTAL_TIMEOUT", "25"))
 LIVE_CHECK_DEFAULT_CONCURRENCY = int(os.getenv("LIVE_CHECK_CONCURRENCY", "25"))
 LIVE_CHECK_PAGE_TIMEOUT_MS = int(os.getenv("LIVE_CHECK_TIMEOUT_MS", "15000"))
 UID_PROBE_UA_FILE = os.getenv("UID_PROBE_UA_FILE", "uid_probe_user_agents.txt").strip()
@@ -206,6 +207,15 @@ def get_telegram_relay_timeout_seconds() -> float:
     except Exception:
         value = 20.0
     return max(1.0, value)
+
+
+def get_latest_post_total_timeout_seconds() -> float:
+    raw = str(os.getenv("LATEST_POST_TOTAL_TIMEOUT", LATEST_POST_TOTAL_TIMEOUT_SECONDS)).strip()
+    try:
+        value = float(raw)
+    except Exception:
+        value = LATEST_POST_TOTAL_TIMEOUT_SECONDS
+    return max(5.0, value)
 
 
 def build_forward_url(base_url: str, query_string: str = "") -> str:
@@ -2394,6 +2404,29 @@ async def check(req: CheckRequest, x_api_key: Optional[str] = Header(default=Non
 async def latest_post(req: CheckRequest, x_api_key: Optional[str] = Header(default=None)) -> Dict[str, Any]:
     ensure_api_key(x_api_key)
 
+    timeout_seconds = get_latest_post_total_timeout_seconds()
+    try:
+        return await asyncio.wait_for(
+            latest_post_impl(req),
+            timeout=timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        raw_url = str(req.url or "").strip()
+        uid = normalize_uid(req.uid) or extract_uid_from_url(raw_url)
+        return {
+            "ok": False,
+            "uid": uid,
+            "postId": "",
+            "timestamp": 0,
+            "link": "",
+            "method": "latest_post_timeout",
+            "reason": "latest_post_timeout",
+            "httpCode": 0,
+            "timeoutSeconds": timeout_seconds,
+        }
+
+
+async def latest_post_impl(req: CheckRequest) -> Dict[str, Any]:
     raw_url = str(req.url or "").strip()
     uid = normalize_uid(req.uid) or extract_uid_from_url(raw_url)
     if not uid and raw_url:
