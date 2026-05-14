@@ -37,7 +37,7 @@ except Exception:
 APP_NAME = "uid-checker-service"
 API_KEY = os.getenv("UID_CHECKER_API_KEY", "").strip()
 HTTP_TIMEOUT_SECONDS = float(os.getenv("UID_CHECKER_TIMEOUT", "10"))
-LATEST_POST_TOTAL_TIMEOUT_SECONDS = float(os.getenv("LATEST_POST_TOTAL_TIMEOUT", "25"))
+LATEST_POST_TOTAL_TIMEOUT_SECONDS = float(os.getenv("LATEST_POST_TOTAL_TIMEOUT", "15"))
 LIVE_CHECK_DEFAULT_CONCURRENCY = int(os.getenv("LIVE_CHECK_CONCURRENCY", "25"))
 LIVE_CHECK_PAGE_TIMEOUT_MS = int(os.getenv("LIVE_CHECK_TIMEOUT_MS", "15000"))
 UID_PROBE_UA_FILE = os.getenv("UID_PROBE_UA_FILE", "uid_probe_user_agents.txt").strip()
