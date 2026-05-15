@@ -144,6 +144,10 @@ Vao Render -> Service -> Environment:
 - `TELEGRAM_RELAY_TIMEOUT`: timeout relay Telegram, mac dinh `20` giay.
 - `LIVE_CHECK_CONCURRENCY`: gioi han song song cho LIVE check, mac dinh `25`.
 - `LIVE_CHECK_TIMEOUT_MS`: timeout load trang cho LIVE check, mac dinh `15000`.
+- `LATEST_POST_TOTAL_TIMEOUT`: timeout tong endpoint `/latest-post`, mac dinh `15` giay.
+- `LATEST_POST_NO_COOKIE_ATTEMPT_TIMEOUT`: timeout cho lane probe `no_cookie` truoc fallback, mac dinh `8.5` giay.
+- `LATEST_POST_NO_COOKIE_MAX_PROBE_URLS`: so URL probe toi da cho `no_cookie`, mac dinh `4`.
+- `LATEST_POST_NO_COOKIE_MAX_USER_AGENTS`: so user-agent toi da cho `no_cookie`, mac dinh `2`.
 
 Ghi chu:
 

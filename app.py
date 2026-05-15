@@ -218,6 +218,33 @@ def get_latest_post_total_timeout_seconds() -> float:
     return max(5.0, value)
 
 
+def get_latest_post_no_cookie_attempt_timeout_seconds() -> float:
+    raw = str(os.getenv("LATEST_POST_NO_COOKIE_ATTEMPT_TIMEOUT", "8.5")).strip()
+    try:
+        value = float(raw)
+    except Exception:
+        value = 8.5
+    return max(4.0, min(20.0, value))
+
+
+def get_latest_post_no_cookie_max_probe_urls() -> int:
+    raw = str(os.getenv("LATEST_POST_NO_COOKIE_MAX_PROBE_URLS", "4")).strip()
+    try:
+        value = int(raw)
+    except Exception:
+        value = 4
+    return max(2, min(8, value))
+
+
+def get_latest_post_no_cookie_max_user_agents() -> int:
+    raw = str(os.getenv("LATEST_POST_NO_COOKIE_MAX_USER_AGENTS", "2")).strip()
+    try:
+        value = int(raw)
+    except Exception:
+        value = 2
+    return max(1, min(4, value))
+
+
 def build_forward_url(base_url: str, query_string: str = "") -> str:
     target = str(base_url or "").strip()
     if not target:
@@ -1490,18 +1517,39 @@ async def fetch_latest_facebook_post_once(
                         body = await resp.text(errors="ignore")
                         final_url = str(resp.url)
                         parsed = parse_latest_post_from_html(body)
-                        has_post_candidate = bool(parsed and is_latest_post_id_token(parsed.get("postId")))
-                        has_evidence = has_post_candidate and has_latest_post_evidence_in_html(body, parsed.get("postId"))
+                        parsed_post_id = str(parsed.get("postId") or "").strip() if isinstance(parsed, dict) else ""
+                        parsed_timestamp = int(parsed.get("timestamp") or 0) if isinstance(parsed, dict) else 0
+                        has_post_candidate = bool(parsed_post_id and is_latest_post_id_token(parsed_post_id))
+                        has_evidence = has_post_candidate and has_latest_post_evidence_in_html(body, parsed_post_id)
                         http_success = 200 <= http_code < 400
+                        candidate_final_url_post_id = (
+                            extract_facebook_post_id_from_url(final_url)
+                            if has_post_candidate else ""
+                        )
+                        post_content = (
+                            extract_latest_post_content_from_html(body, parsed_post_id)
+                            if has_post_candidate else ""
+                        )
+                        no_cookie_candidate_ok = (
+                            bool(parsed_timestamp)
+                            or (
+                                bool(candidate_final_url_post_id)
+                                and candidate_final_url_post_id == parsed_post_id
+                            )
+                            or bool(post_content)
+                        )
+                        candidate_trust_ok = has_post_candidate and http_success and (
+                            has_evidence
+                            or (not normalized_session_cookies and no_cookie_candidate_ok)
+                        )
 
-                        if has_post_candidate and has_evidence and http_success:
-                            post_content = extract_latest_post_content_from_html(body, parsed["postId"])
+                        if candidate_trust_ok:
                             return {
                                 "ok": True,
                                 "uid": normalized_uid,
-                                "postId": parsed["postId"],
-                                "timestamp": parsed["timestamp"],
-                                "link": build_latest_post_link(normalized_uid, parsed["postId"]),
+                                "postId": parsed_post_id,
+                                "timestamp": parsed_timestamp,
+                                "link": build_latest_post_link(normalized_uid, parsed_post_id),
                                 "content": post_content,
                                 "postContent": post_content,
                                 "method": "with_cookie" if normalized_session_cookies else "no_cookie",
@@ -1519,7 +1567,11 @@ async def fetch_latest_facebook_post_once(
                             }
                         fail_reason = build_latest_post_failure_reason(body, final_url, http_code)
                         if has_post_candidate and not has_evidence and http_success:
-                            fail_reason = f"latest_post_candidate_untrusted_http_{http_code or 0}"
+                            fail_reason = (
+                                f"latest_post_candidate_untrusted_http_{http_code or 0}"
+                                if normalized_session_cookies or not no_cookie_candidate_ok
+                                else f"latest_post_candidate_skipped_http_{http_code or 0}"
+                            )
                         attempts.append(
                             {
                                 "url": probe_url,
@@ -1571,7 +1623,7 @@ async def get_latest_facebook_post(
     # For latest-post, prioritize public/no-cookie probing first.
     # Cookie probing is fallback-only when no-cookie cannot get a reliable post.
     raw_candidates = build_cookie_candidates(cookies, cookies_pool)
-    candidates: List[Dict[str, Any]] = [{"source": "no_cookie", "cookies": {}}]
+    cookie_candidates: List[Dict[str, Any]] = []
     seen_fingerprints = {"__empty__"}
     for item in raw_candidates:
         source = str(item.get("source") if isinstance(item, dict) else "") or "cookie"
@@ -1582,7 +1634,22 @@ async def get_latest_facebook_post(
         if fingerprint in seen_fingerprints:
             continue
         seen_fingerprints.add(fingerprint)
-        candidates.append({"source": source, "cookies": candidate_cookies})
+        cookie_candidates.append({"source": source, "cookies": candidate_cookies})
+
+    def _cookie_source_priority(item: Dict[str, Any]) -> int:
+        source = str(item.get("source") or "")
+        if source.startswith("request_pool_"):
+            return 0
+        if source.startswith("env_pool_"):
+            return 1
+        if source == "request_cookie":
+            return 2
+        if source == "env_default":
+            return 3
+        return 4
+
+    cookie_candidates.sort(key=lambda item: (_cookie_source_priority(item), str(item.get("source") or "")))
+    candidates: List[Dict[str, Any]] = [{"source": "no_cookie", "cookies": {}}] + cookie_candidates
 
     cookie_attempts: List[Dict[str, Any]] = []
     final_result: Optional[Dict[str, Any]] = None
@@ -1597,9 +1664,21 @@ async def get_latest_facebook_post(
             uid=uid,
             proxy=proxy,
             session_cookies=candidate_cookies,
-            attempt_timeout_sec=6.0 if (is_no_cookie_candidate and len(candidates) > 1) else None,
-            max_probe_urls=2 if (is_no_cookie_candidate and len(candidates) > 1) else 0,
-            max_user_agents=1 if (is_no_cookie_candidate and len(candidates) > 1) else 0,
+            attempt_timeout_sec=(
+                get_latest_post_no_cookie_attempt_timeout_seconds()
+                if (is_no_cookie_candidate and len(candidates) > 1)
+                else None
+            ),
+            max_probe_urls=(
+                get_latest_post_no_cookie_max_probe_urls()
+                if (is_no_cookie_candidate and len(candidates) > 1)
+                else 0
+            ),
+            max_user_agents=(
+                get_latest_post_no_cookie_max_user_agents()
+                if (is_no_cookie_candidate and len(candidates) > 1)
+                else 0
+            ),
         )
         current["cookieSource"] = source
         current["cookieAttempt"] = idx + 1
