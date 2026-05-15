@@ -1557,7 +1557,22 @@ async def get_latest_facebook_post(
     cookies: Optional[Dict[str, str]] = None,
     cookies_pool: Optional[List[Dict[str, str]]] = None,
 ) -> Dict[str, Any]:
-    candidates = build_cookie_candidates(cookies, cookies_pool)
+    # For latest-post, prioritize public/no-cookie probing first.
+    # Cookie probing is fallback-only when no-cookie cannot get a reliable post.
+    raw_candidates = build_cookie_candidates(cookies, cookies_pool)
+    candidates: List[Dict[str, Any]] = [{"source": "no_cookie", "cookies": {}}]
+    seen_fingerprints = {"__empty__"}
+    for item in raw_candidates:
+        source = str(item.get("source") if isinstance(item, dict) else "") or "cookie"
+        candidate_cookies = normalize_cookies(item.get("cookies") if isinstance(item, dict) else None)
+        if not candidate_cookies:
+            continue
+        fingerprint = cookie_fingerprint(candidate_cookies)
+        if fingerprint in seen_fingerprints:
+            continue
+        seen_fingerprints.add(fingerprint)
+        candidates.append({"source": source, "cookies": candidate_cookies})
+
     cookie_attempts: List[Dict[str, Any]] = []
     final_result: Optional[Dict[str, Any]] = None
     best_failure: Optional[Dict[str, Any]] = None
