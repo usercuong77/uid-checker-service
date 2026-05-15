@@ -1418,6 +1418,9 @@ async def fetch_latest_facebook_post_once(
     uid: str,
     proxy: Optional[str] = None,
     session_cookies: Optional[Dict[str, str]] = None,
+    attempt_timeout_sec: Optional[float] = None,
+    max_probe_urls: int = 0,
+    max_user_agents: int = 0,
 ) -> Dict[str, Any]:
     normalized_uid = normalize_uid(uid)
     if not normalized_uid:
@@ -1432,7 +1435,10 @@ async def fetch_latest_facebook_post_once(
             "httpCode": 0,
         }
 
-    timeout = aiohttp.ClientTimeout(total=max(5.0, HTTP_TIMEOUT_SECONDS))
+    timeout_total = HTTP_TIMEOUT_SECONDS
+    if isinstance(attempt_timeout_sec, (int, float)) and float(attempt_timeout_sec) > 0:
+        timeout_total = float(attempt_timeout_sec)
+    timeout = aiohttp.ClientTimeout(total=max(3.0, timeout_total))
     normalized_session_cookies = normalize_cookies(session_cookies)
     user_agents_raw = [
         pick_user_agent(),
@@ -1460,6 +1466,11 @@ async def fetch_latest_facebook_post_once(
         "Upgrade-Insecure-Requests": "1",
     }
     probe_urls = build_facebook_latest_post_probe_urls(normalized_uid)
+    if max_probe_urls and max_probe_urls > 0:
+        probe_urls = probe_urls[: max(1, int(max_probe_urls))]
+
+    if max_user_agents and max_user_agents > 0:
+        user_agents = user_agents[: max(1, int(max_user_agents))]
     attempts: List[Dict[str, Any]] = []
 
     async with aiohttp.ClientSession(timeout=timeout, cookies=normalized_session_cookies) as session:
@@ -1580,11 +1591,15 @@ async def get_latest_facebook_post(
     for idx, candidate in enumerate(candidates):
         candidate_cookies = candidate.get("cookies") if isinstance(candidate, dict) else {}
         source = str(candidate.get("source") if isinstance(candidate, dict) else "") or f"cookie_{idx + 1}"
+        is_no_cookie_candidate = not normalize_cookies(candidate_cookies if isinstance(candidate_cookies, dict) else None)
 
         current = await fetch_latest_facebook_post_once(
             uid=uid,
             proxy=proxy,
             session_cookies=candidate_cookies,
+            attempt_timeout_sec=6.0 if (is_no_cookie_candidate and len(candidates) > 1) else None,
+            max_probe_urls=2 if (is_no_cookie_candidate and len(candidates) > 1) else 0,
+            max_user_agents=1 if (is_no_cookie_candidate and len(candidates) > 1) else 0,
         )
         current["cookieSource"] = source
         current["cookieAttempt"] = idx + 1
