@@ -170,6 +170,9 @@ class CheckRequest(BaseModel):
     cookies: Optional[Dict[str, str]] = Field(default=None)
     cookiesPool: Optional[List[Dict[str, str]]] = Field(default=None)
     cookies_pool: Optional[List[Dict[str, str]]] = Field(default=None)
+    latestPostMode: Optional[str] = Field(default=None)
+    latest_post_mode: Optional[str] = Field(default=None)
+    mode: Optional[str] = Field(default=None)
 
 
 class LiveCheckRequest(BaseModel):
@@ -799,6 +802,15 @@ def pick_user_agent() -> str:
 def normalize_uid(uid_raw: Optional[str]) -> str:
     uid = str(uid_raw or "").strip()
     return uid if re.fullmatch(r"\d{8,}", uid) else ""
+
+
+def normalize_latest_post_mode(mode_raw: Any) -> str:
+    mode = str(mode_raw or "").strip().lower()
+    if mode in {"with_cookie", "with-cookie", "cookie", "cookies"}:
+        return "with_cookie"
+    if mode in {"auto", "fallback", "mixed"}:
+        return "auto"
+    return "no_cookie"
 
 
 def extract_uid_from_url(url_raw: Optional[str]) -> str:
@@ -1619,9 +1631,11 @@ async def get_latest_facebook_post(
     proxy: Optional[str] = None,
     cookies: Optional[Dict[str, str]] = None,
     cookies_pool: Optional[List[Dict[str, str]]] = None,
+    mode: str = "auto",
 ) -> Dict[str, Any]:
-    # For latest-post, prioritize public/no-cookie probing first.
-    # Cookie probing is fallback-only when no-cookie cannot get a reliable post.
+    resolved_mode = normalize_latest_post_mode(mode)
+    # For latest-post, default behavior should prioritize public/no-cookie probing first.
+    # Cookie probing is used only when explicitly requested or in auto fallback mode.
     raw_candidates = build_cookie_candidates(cookies, cookies_pool)
     cookie_candidates: List[Dict[str, Any]] = []
     seen_fingerprints = {"__empty__"}
@@ -1649,7 +1663,28 @@ async def get_latest_facebook_post(
         return 4
 
     cookie_candidates.sort(key=lambda item: (_cookie_source_priority(item), str(item.get("source") or "")))
-    candidates: List[Dict[str, Any]] = [{"source": "no_cookie", "cookies": {}}] + cookie_candidates
+    candidates: List[Dict[str, Any]] = []
+    if resolved_mode == "with_cookie":
+        if cookie_candidates:
+            candidates = cookie_candidates
+        else:
+            return {
+                "ok": False,
+                "uid": normalize_uid(uid),
+                "postId": "",
+                "timestamp": 0,
+                "link": "",
+                "method": "with_cookie",
+                "reason": "with_cookie_not_configured",
+                "httpCode": 0,
+                "cookieAttempts": [],
+                "cookieFallbackUsed": False,
+                "latestPostMode": resolved_mode,
+            }
+    elif resolved_mode == "no_cookie":
+        candidates = [{"source": "no_cookie", "cookies": {}}]
+    else:
+        candidates = [{"source": "no_cookie", "cookies": {}}] + cookie_candidates
 
     cookie_attempts: List[Dict[str, Any]] = []
     final_result: Optional[Dict[str, Any]] = None
@@ -1666,17 +1701,17 @@ async def get_latest_facebook_post(
             session_cookies=candidate_cookies,
             attempt_timeout_sec=(
                 get_latest_post_no_cookie_attempt_timeout_seconds()
-                if (is_no_cookie_candidate and len(candidates) > 1)
+                if (is_no_cookie_candidate and resolved_mode != "with_cookie")
                 else None
             ),
             max_probe_urls=(
                 get_latest_post_no_cookie_max_probe_urls()
-                if (is_no_cookie_candidate and len(candidates) > 1)
+                if (is_no_cookie_candidate and resolved_mode != "with_cookie")
                 else 0
             ),
             max_user_agents=(
                 get_latest_post_no_cookie_max_user_agents()
-                if (is_no_cookie_candidate and len(candidates) > 1)
+                if (is_no_cookie_candidate and resolved_mode != "with_cookie")
                 else 0
             ),
         )
@@ -1711,7 +1746,8 @@ async def get_latest_facebook_post(
         }
 
     final_result["cookieAttempts"] = cookie_attempts
-    final_result["cookieFallbackUsed"] = len(cookie_attempts) > 1
+    final_result["cookieFallbackUsed"] = (resolved_mode == "auto" and len(cookie_attempts) > 1)
+    final_result["latestPostMode"] = resolved_mode
     return final_result
 
 
@@ -2492,12 +2528,15 @@ async def telegram_webhook_relay(request: Request) -> Response:
 async def check(req: CheckRequest, x_api_key: Optional[str] = Header(default=None)) -> Dict[str, Any]:
     ensure_api_key(x_api_key)
 
-    uid = normalize_uid(req.uid) or extract_uid_from_url(req.url)
+    raw_url = str(req.url or "").strip()
+    uid = normalize_uid(req.uid) or extract_uid_from_url(raw_url)
+    if not uid and raw_url:
+        uid = await resolve_uid_from_facebook_url(raw_url, req.proxy)
     if not uid:
         return {
             "uid": "",
             "status": "UNKNOWN",
-            "reason": "invalid_uid",
+            "reason": "uid_resolve_failed",
             "httpCode": 0,
         }
 
@@ -2537,6 +2576,7 @@ async def latest_post(req: CheckRequest, x_api_key: Optional[str] = Header(defau
 
 async def latest_post_impl(req: CheckRequest) -> Dict[str, Any]:
     raw_url = str(req.url or "").strip()
+    post_mode = normalize_latest_post_mode(req.latestPostMode or req.latest_post_mode or req.mode)
     uid = normalize_uid(req.uid) or extract_uid_from_url(raw_url)
     if not uid and raw_url:
         uid = await resolve_uid_from_facebook_url(raw_url, req.proxy)
@@ -2554,7 +2594,10 @@ async def latest_post_impl(req: CheckRequest) -> Dict[str, Any]:
         }
 
     request_pool = req.cookiesPool or req.cookies_pool
-    return await get_latest_facebook_post(uid, req.proxy, req.cookies, request_pool)
+    result = await get_latest_facebook_post(uid, req.proxy, req.cookies, request_pool, mode=post_mode)
+    if isinstance(result, dict):
+        result["latestPostMode"] = post_mode
+    return result
 
 
 @app.post("/live-check")
