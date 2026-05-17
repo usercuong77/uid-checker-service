@@ -1,5 +1,0 @@
-﻿__pycache__/
-*.py[cod]
-.env
-local_secrets/
-.pytest_cache/
